@@ -971,17 +971,23 @@ parse_report(const uint8_t *report)
 	}
 }
 
+static bool nvt_page_set;
+
 static bool
 nvt_read_points(uint8_t *point_data)
 {
 	uint8_t buf[NVT_POINT_DATA_LEN + 2];
 
-	if (!nvt_set_page(nvt_event_buf)) {
-		return false;
+	if (!nvt_page_set) {
+		if (!nvt_set_page(nvt_event_buf)) {
+			return false;
+		}
+		nvt_page_set = true;
 	}
 	memset(buf, 0, sizeof(buf));
 	buf[0] = 0;
 	if (!nvt_read(buf, NVT_POINT_DATA_LEN + 1)) {
+		nvt_page_set = false;    /* page may have been lost; set it again next time */
 		return false;
 	}
 	memcpy(point_data, buf, NVT_POINT_DATA_LEN + 1);
@@ -1251,36 +1257,51 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	printf("citrus-touch: %s ready; the interrupt line is looked at every %u us; panel %u x %u\n",
 	    chip == CHIP_NOVATEK ? "Novatek" : "FT8719", poll_us, touch_max_x, touch_max_y);
-	for (unsigned tick = 1;; tick++) {
-		uint64_t looked = micros_now(), read_at;
-		uint8_t report[NVT_POINT_DATA_LEN + 2];
+	{
+		unsigned int_low = 0;
 
-		stats.polls++;
-		if (!gpio_get(PIN_INT)) {
-			if (touch_report(report)) {
-				stats.reports++;
-				if (chip == CHIP_NOVATEK) {
-					nvt_parse_points(report);
-				} else {
-					parse_report(report);
+		/* INT often sits low until firmware is happy; do not SPI-hammer the bus. */
+		for (unsigned tick = 1;; tick++) {
+			uint64_t looked = micros_now(), read_at;
+			uint8_t report[NVT_POINT_DATA_LEN + 2];
+			unsigned int_now = gpio_get(PIN_INT);
+
+			stats.polls++;
+			if (!int_now) {
+				int_low++;
+				/*
+				 * While the line has never gone high, only peek every ~250 ms so a
+				 * stuck-low INT cannot wedge the serial engine (watchdog reset).
+				 */
+				if (int_low < 4 || (tick % 32) == 0) {
+					if (touch_report(report)) {
+						stats.reports++;
+						if (chip == CHIP_NOVATEK) {
+							nvt_parse_points(report);
+						} else {
+							parse_report(report);
+						}
+					} else {
+						stats.bad++;
+					}
+					read_at = micros_now();
+					reads++;
+					reading += read_at - looked;
+					if (latency) {
+						redwood_tl("tl: seen %llu read %llu\n", looked, read_at);
+					}
 				}
 			} else {
-				stats.bad++;
+				int_low = 0;
 			}
-			read_at = micros_now();
-			reads++;
-			reading += read_at - looked;
-			if (latency) {
-				redwood_tl("tl: seen %llu read %llu\n", looked, read_at);
+			if (tick % (60 * (1000000 / poll_us)) == 0) {
+				printf("citrus-touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
+				    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us\n",
+				    stats.reports, stats.polls, stats.bad, stats.points, stats.last_x, stats.last_y,
+				    int_now ? "high" : "low", reads ? reading / reads : 0, poll_us);
 			}
+			sleep_us(poll_us);
 		}
-		if (tick % (60 * (1000000 / poll_us)) == 0) {
-			printf("citrus-touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us\n",
-			    stats.reports, stats.polls, stats.bad, stats.points, stats.last_x, stats.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us);
-		}
-		sleep_us(poll_us);
 	}
 }
 
