@@ -116,6 +116,12 @@ sleep_ms(uint32_t ms)
 #define TLMM_SOUTH_PHYS         0x00900000UL
 #define TLMM_EAST_PHYS          0x00d00000UL
 #define TLMM_TILE_SIZE          0x00400000UL
+/* Full tiles are 4 MB each; mapping two of them plus GCC exhausts the IO map
+ * window (kmem_alloc 1 MB then panics). Only the GPIO pages we touch. */
+#define TLMM_WEST_MAP_PINS      94              /* gpio 0..93 inclusive */
+#define TLMM_WEST_MAP_SIZE      (0x1000UL * TLMM_WEST_MAP_PINS)
+#define TLMM_SOUTH_PIN_OFF      (0x1000UL * PIN_RESET)
+#define TLMM_SOUTH_MAP_SIZE     0x2000UL        /* cfg + io for gpio 103 */
 
 #define PULL_NONE               0
 #define PULL_UP                 3
@@ -141,7 +147,8 @@ gpio_regs(unsigned pin)
 	case PIN_INT:
 		return tlmm_west + 0x1000UL * pin;
 	case PIN_RESET:
-		return tlmm_south + 0x1000UL * pin;
+		/* tlmm_south is already mapped at this pin's cfg register */
+		return tlmm_south;
 	default:
 		return 0;
 	}
@@ -185,7 +192,7 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 /* ---- clocks (GCC at 0x1400000) ------------------------------------------------------------------ */
 
 #define GCC_PHYS                0x01400000UL
-#define GCC_SIZE                0x00100000UL
+#define GCC_SIZE                0x00020000UL    /* through SE2 RCG at 0x1f3ac */
 #define GCC_VOTE                (gcc + 0x7900c)         /* the application processor's votes */
 #define VOTE_M_AHB              (1u << 6)
 #define VOTE_S_AHB              (1u << 7)
@@ -956,10 +963,16 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 		poll_us = 8000;
 	}
 
-	tlmm_west = ml_io_map(TLMM_WEST_PHYS, TLMM_TILE_SIZE);
-	tlmm_south = ml_io_map(TLMM_SOUTH_PHYS, TLMM_TILE_SIZE);
+	tlmm_west = ml_io_map(TLMM_WEST_PHYS, TLMM_WEST_MAP_SIZE);
+	tlmm_south = ml_io_map(TLMM_SOUTH_PHYS + TLMM_SOUTH_PIN_OFF, TLMM_SOUTH_MAP_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 	se = ml_io_map(SE_PHYS, SE_SIZE);
+	if (tlmm_west == 0 || tlmm_south == 0 || gcc == 0 || se == 0) {
+		printf("citrus-touch: ml_io_map failed (west %#lx south %#lx gcc %#lx se %#lx)\n",
+		    tlmm_west, tlmm_south, gcc, se);
+		thread_terminate(current_thread());
+		return;
+	}
 	printf("citrus-touch: mapped west %#lx south %#lx, clocks %#lx, engine %#lx (steps %u)\n",
 	    tlmm_west, tlmm_south, gcc, se, steps);
 	printf("citrus-touch: gpio6/7/71/80/93 west, gpio103 south; cfg 6=%#lx 71=%#lx 103=%#lx\n",
