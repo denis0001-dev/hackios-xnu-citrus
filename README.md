@@ -100,6 +100,9 @@ adb pull /vendor/firmware/aw8697_haptic.bin fw-haptic/                          
 (Put the `fw-*` directories next to the workspace. Wi-Fi also needs `fw-wifi/mac` — the radio's address on one
 line — and `fw-wifi/network` — network name and password. `userland/build.sh` prints which firmware went in.)
 
+Citrus (POCO M3, Adreno 610): pull `a610_zap.{mdt,b00,b01,b02}` from that phone's `/vendor/firmware` into
+`fw-gpu/`. `a630_sqe.fw` is not on the vendor image — take it from linux-firmware `qcom/a630_sqe.fw`.
+
 ```sh
 common/build.sh redwood GL=1          # images + out/redwood-boot.img
 common/run.sh redwood 900             # loader into RAM, system image into RAM, a 15-minute session
