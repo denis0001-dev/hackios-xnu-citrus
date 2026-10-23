@@ -40,8 +40,12 @@
  * No interrupt is used: a thread looks at the interrupt line 125 times a second (boot-arg
  * touch_poll_us=N: every N microseconds instead of 8000).
  *
- * Boot args: citrus_touch=1, touch_spi_hz=N (default 400000), citrus_touch_simple=1 (one
- * engine command per package instead of the split), touch_flip=1..3, touch_poll_us=N.
+ * Novatek NT36672x (BOM alternate on the same SPI2/CS0/reset/IRQ): SPI mode 0, then a host
+ * download of the panel firmware into SRAM (vendor BOOT_UPDATE_FIRMWARE) before reports work.
+ *
+ * Boot args: citrus_touch=1, touch_spi_hz=N (default 400000; Novatek bumps to 8 MHz),
+ * citrus_touch_simple=1 (one engine command per package instead of the split),
+ * touch_flip=1..3, touch_poll_us=N.
  *
  * Register layouts: drivers/clk/qcom/gcc-sm6115.c (vote 0x7900c bits 6,7,8,9,12; SE2 CBCR
  * 0x1f3a4; SE2 RCG 0x1f3a8/0x1f3ac), drivers/pinctrl/qcom/pinctrl-sm6115.c (tiles west
@@ -56,6 +60,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
+
+#include "citrus_novatek_fw.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -416,7 +422,8 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length, bool more)
 	wr(SPI_TX_TRANS_LEN, length);
 	wr(SPI_RX_TRANS_LEN, length);
 	wr(GENI_M_CMD0, SPI_FULL_DUPLEX | (more ? M_PARAM_FRAGMENT : 0));
-	clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
+	/* large host-download chunks need more than the old fixed 200 ms */
+	clock_interval_to_deadline(200 + length / 40 + 1, NSEC_PER_MSEC, &deadline);
 	while (mach_absolute_time() < deadline) {
 		while (sent < length && (rd(GENI_TX_FIFO_STATUS) & 0x0fffffff) + 1 < fifo_depth) {
 			uint32_t word = 0;
@@ -528,6 +535,7 @@ enum { REPORT_UNKNOWN, REPORT_COMMAND, REPORT_BARE };
 
 static uint8_t ft_tx[FTS_MAX_READ + 4], ft_rx[FTS_MAX_READ + 4];
 static enum { CHIP_UNKNOWN, CHIP_FOCALTECH, CHIP_NOVATEK, CHIP_ABSENT } chip;
+static uint32_t touch_max_x = 1080, touch_max_y = 2340;   /* panel pixels; Novatek FW info may replace */
 
 static void
 geni_spi_mode(unsigned mode)
@@ -535,6 +543,15 @@ geni_spi_mode(unsigned mode)
 	/* SPI mode: bit0 = CPHA, bit1 = CPOL */
 	wr(SPI_CPHA, mode & 1);
 	wr(SPI_CPOL, (mode >> 1) & 1);
+}
+
+static void
+geni_spi_hz(uint32_t hz)
+{
+	uint32_t divider = (se_source_hz + hz - 1) / hz;
+
+	wr(GENI_CLK_SEL, 0);
+	wr(GENI_SER_M_CLK_CFG, (divider ? divider : 1) << 4 | 1);
 }
 static int report_kind = REPORT_UNKNOWN;
 static bool fts_with_length = true;     /* the command carries the length (a running firmware) */
@@ -824,6 +841,293 @@ nvt_bootloader_reset(void)
 	nvt_write_addr(NVT_SPI_RD_FAST_ADDR, 0x00);
 }
 
+#define NVT_BOOT_RDY_ADDR       0x3F10D
+#define NVT_BLD_CRC_EN_ADDR     0x3F30E
+#define NVT_ILM_DES_ADDR        0x3F128
+#define NVT_ILM_LENGTH_ADDR     0x3F118
+#define NVT_DLM_DES_ADDR        0x3F12C
+#define NVT_DLM_LENGTH_ADDR     0x3F130
+#define NVT_G_ILM_CHECKSUM_ADDR 0x3F100
+#define NVT_G_DLM_CHECKSUM_ADDR 0x3F104
+#define NVT_EVENT_MAP_HOST_CMD  0x50
+#define NVT_EVENT_MAP_RESET     0x60
+#define NVT_EVENT_MAP_FWINFO    0x78
+#define NVT_RESET_STATE_INIT    0xA0
+#define NVT_RESET_STATE_MAX     0xAF
+#define NVT_FW_CHUNK            4096
+#define NVT_BIN_MAP_MAX         32
+
+struct nvt_bin_map {
+	uint32_t bin_addr, sram_addr, size, crc;
+};
+
+static uint32_t
+nvt_word(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static bool
+nvt_check_fw_reset_state(uint8_t want, int retries)
+{
+	uint8_t buf[8];
+
+	for (int i = 0; i < retries; i++) {
+		if (!nvt_set_page(nvt_event_buf | NVT_EVENT_MAP_RESET)) {
+			sleep_ms(10);
+			continue;
+		}
+		memset(buf, 0, sizeof(buf));
+		buf[0] = NVT_EVENT_MAP_RESET;
+		if (!nvt_read(buf, 6)) {
+			sleep_ms(10);
+			continue;
+		}
+		if (buf[1] >= want && buf[1] <= NVT_RESET_STATE_MAX) {
+			printf("citrus-touch: Novatek firmware reset state %#x (wanted %#x)\n", buf[1], want);
+			return true;
+		}
+		if (i == 0 || i + 1 == retries) {
+			printf("citrus-touch: Novatek reset state %#x %#x %#x %#x %#x (wanted %#x+)\n",
+			    buf[1], buf[2], buf[3], buf[4], buf[5], want);
+		}
+		sleep_ms(10);
+	}
+	return false;
+}
+
+static void
+nvt_bld_crc_enable(void)
+{
+	uint8_t buf[2];
+
+	if (!nvt_set_page(NVT_BLD_CRC_EN_ADDR)) {
+		return;
+	}
+	memset(buf, 0, sizeof(buf));
+	buf[0] = (uint8_t)(NVT_BLD_CRC_EN_ADDR & 0x7f);
+	if (!nvt_read(buf, 2)) {
+		return;
+	}
+	buf[0] = (uint8_t)(NVT_BLD_CRC_EN_ADDR & 0x7f);
+	buf[1] |= 0x80;
+	nvt_write(buf, 2);
+}
+
+static void
+nvt_fw_crc_enable(void)
+{
+	uint8_t buf[2];
+
+	nvt_set_page(nvt_event_buf);
+	buf[0] = NVT_EVENT_MAP_RESET;
+	buf[1] = 0x00;
+	nvt_write(buf, 2);
+	buf[0] = NVT_EVENT_MAP_HOST_CMD;
+	buf[1] = 0xAE;
+	nvt_write(buf, 2);
+}
+
+static void
+nvt_boot_ready(void)
+{
+	nvt_write_addr(NVT_BOOT_RDY_ADDR, 1);
+	sleep_ms(5);
+}
+
+static void
+nvt_set_bld_crc_bank(uint32_t des_addr, uint32_t sram_addr, uint32_t length_addr,
+    uint32_t size, uint32_t g_checksum_addr, uint32_t crc)
+{
+	uint8_t buf[8];
+
+	nvt_set_page(des_addr);
+	buf[0] = (uint8_t)(des_addr & 0x7f);
+	buf[1] = (uint8_t)sram_addr;
+	buf[2] = (uint8_t)(sram_addr >> 8);
+	buf[3] = (uint8_t)(sram_addr >> 16);
+	nvt_write(buf, 4);
+	buf[0] = (uint8_t)(length_addr & 0x7f);
+	buf[1] = (uint8_t)size;
+	buf[2] = (uint8_t)(size >> 8);
+	nvt_write(buf, 3);              /* NT36672A hw_crc == 1: 2-byte length */
+	buf[0] = (uint8_t)(g_checksum_addr & 0x7f);
+	buf[1] = (uint8_t)crc;
+	buf[2] = (uint8_t)(crc >> 8);
+	buf[3] = (uint8_t)(crc >> 16);
+	buf[4] = (uint8_t)(crc >> 24);
+	nvt_write(buf, 5);
+}
+
+static bool
+nvt_write_sram(const uint8_t *fw, uint32_t sram_addr, uint32_t size, uint32_t bin_addr)
+{
+	static uint8_t chunk[NVT_FW_CHUNK + 1];
+
+	while (size > 0) {
+		uint32_t len = size < NVT_FW_CHUNK ? size : NVT_FW_CHUNK;
+
+		if (!nvt_set_page(sram_addr)) {
+			return false;
+		}
+		chunk[0] = (uint8_t)(sram_addr & 0x7f);
+		memcpy(chunk + 1, fw + bin_addr, len);
+		if (!nvt_write(chunk, len + 1)) {
+			return false;
+		}
+		sram_addr += len;
+		bin_addr += len;
+		size -= len;
+	}
+	return true;
+}
+
+static int
+nvt_parse_bin_map(const uint8_t *fw, uint32_t fwsize, struct nvt_bin_map *map, uint32_t max)
+{
+	uint32_t end = nvt_word(fw);
+	uint32_t info_sec = 0, ovly_sec = 0, partition, list;
+	uint8_t ovly_info;
+
+	if (end < 0x30 || end > fwsize) {
+		return -1;
+	}
+	for (uint32_t pos = 0x30; pos < end; pos += 0x10) {
+		info_sec++;
+	}
+	ovly_info = (uint8_t)((fw[0x28] & 0x10) >> 4);
+	ovly_sec = ovly_info ? (fw[0x28] & 0x0f) : 0;
+	partition = 2 + ovly_sec + info_sec;
+	if (partition == 0 || partition > max) {
+		return -1;
+	}
+	for (list = 0; list < partition; list++) {
+		if (list < 2) {
+			map[list].bin_addr = nvt_word(fw + list * 12);
+			map[list].sram_addr = nvt_word(fw + 4 + list * 12);
+			map[list].size = nvt_word(fw + 8 + list * 12);
+			map[list].crc = nvt_word(fw + 0x18 + list * 4);
+		} else if (list < 2 + info_sec) {
+			uint32_t pos = 0x30 + 0x10 * (list - 2);
+
+			map[list].sram_addr = nvt_word(fw + pos);
+			map[list].size = nvt_word(fw + pos + 4);
+			map[list].bin_addr = nvt_word(fw + pos + 8);
+			map[list].crc = nvt_word(fw + pos + 12);
+		} else {
+			uint32_t pos = map[1].bin_addr + 0x10 * (list - 2 - info_sec);
+
+			if (pos + 16 > fwsize) {
+				return -1;
+			}
+			map[list].sram_addr = nvt_word(fw + pos);
+			map[list].size = nvt_word(fw + pos + 4);
+			map[list].bin_addr = nvt_word(fw + pos + 8);
+			map[list].crc = nvt_word(fw + pos + 12);
+		}
+		if (map[list].size != 0 && map[list].bin_addr + map[list].size + 1 > fwsize) {
+			printf("citrus-touch: Novatek FW part %u past end of the binary\n", list);
+			return -1;
+		}
+	}
+	return (int)partition;
+}
+
+static bool
+nvt_write_firmware(const uint8_t *fw, uint32_t fwsize, const struct nvt_bin_map *map, int partition)
+{
+	for (int list = 0; list < partition; list++) {
+		uint32_t size = map[list].size;
+
+		if (size == 0) {
+			continue;
+		}
+		size += 1;
+		if (!nvt_write_sram(fw, map[list].sram_addr, size, map[list].bin_addr)) {
+			printf("citrus-touch: Novatek SRAM write failed at part %d (sram %#x)\n",
+			    list, map[list].sram_addr);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+nvt_host_download(const uint8_t *fw, uint32_t fwsize, const char *name)
+{
+	struct nvt_bin_map map[NVT_BIN_MAP_MAX];
+	int partition;
+	uint32_t need = 0;
+
+	for (uint32_t i = fwsize / 4096; i > 0; i--) {
+		const uint8_t *end = fw + i * 4096 - 3;
+
+		if ((end[0] == 'N' && end[1] == 'V' && end[2] == 'T') ||
+		    (end[0] == 'M' && end[1] == 'O' && end[2] == 'D')) {
+			need = i * 4096;
+			break;
+		}
+	}
+	if (need == 0 || fw[need - 4096] + fw[need - 4096 + 1] != 0xff) {
+		printf("citrus-touch: Novatek %s firmware looks wrong (need %u)\n", name, need);
+		return false;
+	}
+	partition = nvt_parse_bin_map(fw, fwsize, map, NVT_BIN_MAP_MAX);
+	if (partition < 2) {
+		printf("citrus-touch: Novatek %s firmware header is unreadable\n", name);
+		return false;
+	}
+	printf("citrus-touch: downloading Novatek %s firmware (%u bytes, %d parts)\n",
+	    name, need, partition);
+
+	for (int attempt = 0; attempt < 3; attempt++) {
+		nvt_bootloader_reset();
+		if (!nvt_write_firmware(fw, fwsize, map, partition)) {
+			continue;
+		}
+		nvt_set_bld_crc_bank(NVT_ILM_DES_ADDR, map[0].sram_addr, NVT_ILM_LENGTH_ADDR,
+		    map[0].size, NVT_G_ILM_CHECKSUM_ADDR, map[0].crc);
+		nvt_set_bld_crc_bank(NVT_DLM_DES_ADDR, map[1].sram_addr, NVT_DLM_LENGTH_ADDR,
+		    map[1].size, NVT_G_DLM_CHECKSUM_ADDR, map[1].crc);
+		nvt_bld_crc_enable();
+		nvt_fw_crc_enable();
+		nvt_boot_ready();
+		if (nvt_check_fw_reset_state(NVT_RESET_STATE_INIT, 50)) {
+			uint8_t info[18];
+
+			/* baseline ReK; fingers stay empty until this finishes */
+			(void)nvt_check_fw_reset_state(0xA3, 50);
+			nvt_set_page(nvt_event_buf | NVT_EVENT_MAP_FWINFO);
+			memset(info, 0, sizeof(info));
+			info[0] = NVT_EVENT_MAP_FWINFO;
+			if (nvt_read(info, 17) && (uint8_t)(info[1] + info[2]) == 0xff) {
+				uint32_t abs_x = ((uint32_t)info[5] << 8) | info[6];
+				uint32_t abs_y = ((uint32_t)info[7] << 8) | info[8];
+
+				printf("citrus-touch: Novatek FW ver %#x channels %u x %u abs %u x %u\n",
+				    info[1], info[3], info[4], abs_x, abs_y);
+				if (abs_x >= 320 && abs_x <= 4096) {
+					touch_max_x = abs_x;
+				}
+				if (abs_y >= 320 && abs_y <= 4096) {
+					touch_max_y = abs_y;
+				}
+			} else {
+				printf("citrus-touch: Novatek FW info %#x %#x %#x %#x %#x\n",
+				    info[1], info[2], info[3], info[4], info[5]);
+			}
+			/* report reads are large; drop from the download clock */
+			geni_spi_hz(1000000);
+			geni_spi_mode(0);
+			nvt_set_page(nvt_event_buf);
+			return true;
+		}
+		printf("citrus-touch: Novatek %s download attempt %d did not reach reset %#x\n",
+		    name, attempt + 1, NVT_RESET_STATE_INIT);
+	}
+	return false;
+}
+
 static bool
 novatek_probe(bool verbose)
 {
@@ -855,20 +1159,27 @@ novatek_probe(bool verbose)
 				printf("citrus-touch: Novatek trim %#x: %02x %02x %02x %02x %02x %02x\n",
 				    addrs[a], id[1], id[2], id[3], id[4], id[5], id[6]);
 			}
-			/* anything not all-ones / all-zeros means the SPI path reached a chip */
 			/* trim table: mask {1,0,0,1,1,1} for 0A/0B… 72 66 03 → NT36672A */
 			if (id[1] == 0x0a || id[1] == 0x0b || id[1] == 0x0c || id[1] == 0x0e) {
 				if (id[4] == 0x72 && (id[5] == 0x66 || id[5] == 0x65) && id[6] == 0x03) {
 					nvt_event_buf = NVT_EVENT_BUF_ADDR;
 					printf("citrus-touch: Novatek NT36672x at %#x (event buf %#x)\n",
 					    addrs[a], nvt_event_buf);
-					/* leave bootloader; run the firmware from flash */
-					gpio_output(PIN_RESET, false, PULL_NONE, 8);
-					sleep_ms(20);
-					gpio_set(PIN_RESET, true);
-					sleep_ms(500);
-					nvt_set_page(nvt_event_buf);
-					return true;
+					/* vendor BOOT_UPDATE: SRAM host-download, not NOR flash boot.
+					 * Keep SPI mode 0 (geni_spi_init would force mode 1 and kill writes).
+					 * Bump clock only via the divider — never re-init the engine. */
+					geni_spi_hz(8000000);
+					geni_spi_mode(0);
+					printf("citrus-touch: Novatek SPI mode %u for host-download\n",
+					    (unsigned)(rd(SPI_CPHA) | (rd(SPI_CPOL) << 1)));
+					if (nvt_host_download(citrus_nvt_fw_tianma, CITRUS_NVT_FW_TIANMA_LENGTH,
+					    "tianma") ||
+					    nvt_host_download(citrus_nvt_fw_truly, CITRUS_NVT_FW_TRULY_LENGTH,
+					    "truly")) {
+						return true;
+					}
+					printf("citrus-touch: Novatek host-download failed\n");
+					return false;
 				}
 			}
 			if (!((id[1] == 0xff && id[2] == 0xff && id[3] == 0xff) ||
@@ -893,7 +1204,6 @@ static struct {
 	uint32_t x, y;
 } fingers[FTS_MAX_TOUCHES];
 
-static uint32_t touch_max_x = 1080, touch_max_y = 2340;   /* the device tree's display-coords */
 static uint32_t touch_flip;
 static unsigned shown;
 
@@ -978,16 +1288,15 @@ nvt_read_points(uint8_t *point_data)
 {
 	uint8_t buf[NVT_POINT_DATA_LEN + 2];
 
-	if (!nvt_page_set) {
-		if (!nvt_set_page(nvt_event_buf)) {
-			return false;
-		}
-		nvt_page_set = true;
+	/* vendor re-selects the event page around each report read */
+	if (!nvt_set_page(nvt_event_buf)) {
+		return false;
 	}
+	nvt_page_set = true;
 	memset(buf, 0, sizeof(buf));
 	buf[0] = 0;
 	if (!nvt_read(buf, NVT_POINT_DATA_LEN + 1)) {
-		nvt_page_set = false;    /* page may have been lost; set it again next time */
+		nvt_page_set = false;
 		return false;
 	}
 	memcpy(point_data, buf, NVT_POINT_DATA_LEN + 1);
@@ -1153,7 +1462,7 @@ bring_up(void)
 		printf("citrus-touch: serial engine 2: firmware %#x, interface %#x, parameters %#x, crystal %u Hz\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz);
 		PE_parse_boot_argn("touch_spi_hz", &spi_hz, sizeof(spi_hz));
-		if (spi_hz < 100000 || spi_hz > 10000000) {
+		if (spi_hz < 100000 || spi_hz > 20000000) {
 			spi_hz = 400000;
 		}
 	{
@@ -1260,11 +1569,16 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 	{
 		unsigned int_low = 0;
 
-		/* INT often sits low until firmware is happy; do not SPI-hammer the bus. */
+		/*
+		 * Both chips hold INT low while a report is waiting. Reading clears it (Novatek's
+		 * Linux driver uses EDGE_RISING because the line rises again after the read).
+		 * If we only waited for rising, a stuck-low line would never be drained.
+		 */
 		for (unsigned tick = 1;; tick++) {
 			uint64_t looked = micros_now(), read_at;
 			uint8_t report[NVT_POINT_DATA_LEN + 2];
 			unsigned int_now = gpio_get(PIN_INT);
+			bool do_read = false;
 
 			stats.polls++;
 			if (!int_now) {
@@ -1274,25 +1588,38 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 				 * stuck-low INT cannot wedge the serial engine (watchdog reset).
 				 */
 				if (int_low < 4 || (tick % 32) == 0) {
-					if (touch_report(report)) {
-						stats.reports++;
-						if (chip == CHIP_NOVATEK) {
-							nvt_parse_points(report);
-						} else {
-							parse_report(report);
-						}
-					} else {
-						stats.bad++;
-					}
-					read_at = micros_now();
-					reads++;
-					reading += read_at - looked;
-					if (latency) {
-						redwood_tl("tl: seen %llu read %llu\n", looked, read_at);
-					}
+					do_read = true;
 				}
 			} else {
 				int_low = 0;
+			}
+			if (do_read) {
+				if (touch_report(report)) {
+					stats.reports++;
+					if (chip == CHIP_NOVATEK) {
+						if (stats.reports <= 8 || (stats.reports % 200) == 0) {
+							printf("citrus-touch: Novatek report %u:"
+							    " %02x %02x %02x %02x %02x %02x %02x %02x"
+							    " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							    stats.reports,
+							    report[0], report[1], report[2], report[3],
+							    report[4], report[5], report[6], report[7],
+							    report[8], report[9], report[10], report[11],
+							    report[12], report[13], report[14], report[15]);
+						}
+						nvt_parse_points(report);
+					} else {
+						parse_report(report);
+					}
+				} else {
+					stats.bad++;
+				}
+				read_at = micros_now();
+				reads++;
+				reading += read_at - looked;
+				if (latency) {
+					redwood_tl("tl: seen %llu read %llu\n", looked, read_at);
+				}
 			}
 			if (tick % (60 * (1000000 / poll_us)) == 0) {
 				printf("citrus-touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
