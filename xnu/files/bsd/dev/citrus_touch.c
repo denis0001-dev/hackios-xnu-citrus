@@ -37,8 +37,8 @@
  * Coordinates are the panel's pixels (1080 x 2340, the device tree's display-coords); they
  * are scaled to the 0..65535 that /dev/redwood-touch carries.
  *
- * No interrupt is used: a thread looks at the interrupt line 125 times a second (boot-arg
- * touch_poll_us=N: every N microseconds instead of 8000).
+ * No interrupt is used: a thread looks at the interrupt line (boot-arg touch_poll_us=N:
+ * every N microseconds; default 2000).
  *
  * Novatek NT36672x (BOM alternate on the same SPI2/CS0/reset/IRQ): SPI mode 0, then a host
  * download of the panel firmware into SRAM (vendor BOOT_UPDATE_FIRMWARE) before reports work.
@@ -1116,8 +1116,8 @@ nvt_host_download(const uint8_t *fw, uint32_t fwsize, const char *name)
 				printf("citrus-touch: Novatek FW info %#x %#x %#x %#x %#x\n",
 				    info[1], info[2], info[3], info[4], info[5]);
 			}
-			/* report reads are large; drop from the download clock */
-			geni_spi_hz(1000000);
+			/* keep 8 MHz for reports — 1 MHz made each 66-byte read ~1.5 ms */
+			geni_spi_hz(8000000);
 			geni_spi_mode(0);
 			nvt_set_page(nvt_event_buf);
 			return true;
@@ -1522,7 +1522,8 @@ micros_now(void)
 static void
 touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, latency = 0, reads = 0;
+	/* Novatek INT often stays low; sample often enough that a tap is not a 250 ms lottery */
+	uint32_t poll_us = 2000, latency = 0, reads = 0;
 	uint64_t reading = 0;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
@@ -1541,7 +1542,7 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	if (poll_us < 250 || poll_us > 100000) {
-		poll_us = 8000;
+		poll_us = 2000;
 	}
 
 	tlmm_west = ml_io_map(TLMM_WEST_PHYS, TLMM_WEST_MAP_SIZE);
@@ -1567,12 +1568,14 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 	printf("citrus-touch: %s ready; the interrupt line is looked at every %u us; panel %u x %u\n",
 	    chip == CHIP_NOVATEK ? "Novatek" : "FT8719", poll_us, touch_max_x, touch_max_y);
 	{
-		unsigned int_low = 0;
+		unsigned fail_streak = 0;
 
 		/*
 		 * Both chips hold INT low while a report is waiting. Reading clears it (Novatek's
 		 * Linux driver uses EDGE_RISING because the line rises again after the read).
-		 * If we only waited for rising, a stuck-low line would never be drained.
+		 * On this panel INT often stays low forever, so a "peek every 32 ticks" throttle
+		 * made glass touch sample at ~4 Hz. Drain every poll; only back off when SPI
+		 * keeps failing (that path used to wedge the serial engine / watchdog).
 		 */
 		for (unsigned tick = 1;; tick++) {
 			uint64_t looked = micros_now(), read_at;
@@ -1582,19 +1585,15 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 
 			stats.polls++;
 			if (!int_now) {
-				int_low++;
-				/*
-				 * While the line has never gone high, only peek every ~250 ms so a
-				 * stuck-low INT cannot wedge the serial engine (watchdog reset).
-				 */
-				if (int_low < 4 || (tick % 32) == 0) {
+				if (fail_streak < 8 || (tick % 32) == 0) {
 					do_read = true;
 				}
 			} else {
-				int_low = 0;
+				fail_streak = 0;
 			}
 			if (do_read) {
 				if (touch_report(report)) {
+					fail_streak = 0;
 					stats.reports++;
 					if (chip == CHIP_NOVATEK) {
 						if (stats.reports <= 8 || (stats.reports % 200) == 0) {
@@ -1612,6 +1611,7 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 						parse_report(report);
 					}
 				} else {
+					fail_streak++;
 					stats.bad++;
 				}
 				read_at = micros_now();
