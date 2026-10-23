@@ -37,8 +37,9 @@
  * Coordinates are the panel's pixels (1080 x 2340, the device tree's display-coords); they
  * are scaled to the 0..65535 that /dev/redwood-touch carries.
  *
- * No interrupt is used: a thread looks at the interrupt line (boot-arg touch_poll_us=N:
- * every N microseconds; default 2000).
+ * No interrupt is used: a thread looks at the interrupt line (boot-arg touch_poll_us=N).
+ * Novatek defaults to 8 ms idle peeks; while a finger is down it runs closer to 8 ms too,
+ * and ignores 0xff filler SPI reads so the single boot CPU is not SPI-starved.
  *
  * Novatek NT36672x (BOM alternate on the same SPI2/CS0/reset/IRQ): SPI mode 0, then a host
  * download of the panel firmware into SRAM (vendor BOOT_UPDATE_FIRMWARE) before reports work.
@@ -769,6 +770,7 @@ focaltech_probe(bool verbose)
 #define NVT_MAX_TOUCHES         10
 
 static uint32_t nvt_event_buf = NVT_EVENT_BUF_ADDR;
+static bool nvt_page_set;
 
 static bool
 nvt_xfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
@@ -1119,7 +1121,7 @@ nvt_host_download(const uint8_t *fw, uint32_t fwsize, const char *name)
 			/* keep 8 MHz for reports — 1 MHz made each 66-byte read ~1.5 ms */
 			geni_spi_hz(8000000);
 			geni_spi_mode(0);
-			nvt_set_page(nvt_event_buf);
+			nvt_page_set = nvt_set_page(nvt_event_buf);
 			return true;
 		}
 		printf("citrus-touch: Novatek %s download attempt %d did not reach reset %#x\n",
@@ -1281,15 +1283,45 @@ parse_report(const uint8_t *report)
 	}
 }
 
-static bool nvt_page_set;
+static uint64_t nvt_last_valid_us;      /* last non-filler report (for stuck-contact safety) */
+#define NVT_STALE_UP_US         150000  /* lift if no real report for 150 ms while held */
+#define NVT_IDLE_POLL_US        16000   /* peek while idle: leave the only CPU for SpringBoard */
+#define NVT_ACTIVE_POLL_US      8000    /* while a finger is down / just lifted */
+
+static uint64_t micros_now(void);
+
+static bool
+nvt_report_all_ff(const uint8_t *point_data)
+{
+	for (uint32_t i = 1; i < 7; i++) {
+		if (point_data[i] != 0xff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+any_finger_down(void)
+{
+	for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
+		if (fingers[i].down) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static bool
 nvt_read_points(uint8_t *point_data)
 {
 	uint8_t buf[NVT_POINT_DATA_LEN + 2];
 
-	/* vendor re-selects the event page around each report read */
-	if (!nvt_set_page(nvt_event_buf)) {
+	/*
+	 * Keep the event page selected across reports. Re-writing 0xFF/page every poll
+	 * races the controller and left us reading 0xff fillers between real IRQs.
+	 */
+	if (!nvt_page_set && !nvt_set_page(nvt_event_buf)) {
 		return false;
 	}
 	nvt_page_set = true;
@@ -1306,9 +1338,35 @@ nvt_read_points(uint8_t *point_data)
 static void
 nvt_parse_points(const uint8_t *point_data)
 {
-	bool seen[NVT_MAX_TOUCHES] = { false };
+	struct {
+		uint32_t x, y;
+	} hits[NVT_MAX_TOUCHES];
+	uint32_t nhits = 0, i, best, best_d, dx, dy;
+	uint64_t now;
 
-	for (uint32_t i = 0; i < NVT_MAX_TOUCHES; i++) {
+	/*
+	 * Polling while INT stays low mostly returns 0xff fillers (cleared IRQ buffer).
+	 * Those are not lifts — ignore them. A real empty/lift is a non-filler frame with
+	 * no finger slots (vendor reports BTN_TOUCH=0 from that).
+	 */
+	if (nvt_report_all_ff(point_data)) {
+		now = micros_now();
+		if (nvt_last_valid_us != 0 && now - nvt_last_valid_us >= NVT_STALE_UP_US) {
+			for (i = 0; i < NVT_MAX_TOUCHES; i++) {
+				if (fingers[i].down) {
+					finger_update(i, FTS_EVENT_UP, fingers[i].x, fingers[i].y);
+				}
+			}
+		}
+		return;
+	}
+	/* vendor nvt_fw_recovery: 0x77 fill means ESD, ignore the frame */
+	if (point_data[1] == 0x77 && point_data[2] == 0x77 && point_data[3] == 0x77) {
+		return;
+	}
+	nvt_last_valid_us = micros_now();
+
+	for (i = 0; i < NVT_MAX_TOUCHES; i++) {
 		uint32_t position = 1 + 6 * i;
 		uint32_t input_id = point_data[position] >> 3;
 		uint32_t state = point_data[position] & 0x07;
@@ -1317,7 +1375,6 @@ nvt_parse_points(const uint8_t *point_data)
 		if (input_id == 0 || input_id > NVT_MAX_TOUCHES) {
 			continue;
 		}
-		input_id -= 1;
 		if (state != 0x01 && state != 0x02) {
 			continue;
 		}
@@ -1326,11 +1383,46 @@ nvt_parse_points(const uint8_t *point_data)
 		if (x >= touch_max_x || y >= touch_max_y) {
 			continue;
 		}
-		seen[input_id] = true;
-		finger_update(input_id, fingers[input_id].down ? FTS_EVENT_CONTACT : FTS_EVENT_DOWN, x, y);
+		hits[nhits].x = x;
+		hits[nhits].y = y;
+		nhits++;
 	}
-	for (uint32_t i = 0; i < NVT_MAX_TOUCHES; i++) {
-		if (!seen[i] && fingers[i].down) {
+
+	/*
+	 * This IC reassigns tracking IDs between frames (1↔2↔4 for one thumb). Posting each
+	 * ID as its own finger makes SpringBoard see jumps and ghost multitouch. Collapse to
+	 * one logical finger (slot 0): keep the contact nearest the previous point.
+	 */
+	if (nhits == 0) {
+		if (fingers[0].down) {
+			finger_update(0, FTS_EVENT_UP, fingers[0].x, fingers[0].y);
+		}
+		for (i = 1; i < NVT_MAX_TOUCHES; i++) {
+			if (fingers[i].down) {
+				finger_update(i, FTS_EVENT_UP, fingers[i].x, fingers[i].y);
+			}
+		}
+		return;
+	}
+	best = 0;
+	best_d = 0xffffffffu;
+	if (fingers[0].down) {
+		/* previous point is already 0..65535; compare in panel pixels */
+		uint32_t px = (uint32_t)(((uint64_t)fingers[0].x * (touch_max_x - 1)) / 65535);
+		uint32_t py = (uint32_t)(((uint64_t)fingers[0].y * (touch_max_y - 1)) / 65535);
+
+		for (i = 0; i < nhits; i++) {
+			dx = hits[i].x > px ? hits[i].x - px : px - hits[i].x;
+			dy = hits[i].y > py ? hits[i].y - py : py - hits[i].y;
+			if (dx + dy < best_d) {
+				best_d = dx + dy;
+				best = i;
+			}
+		}
+	}
+	finger_update(0, fingers[0].down ? FTS_EVENT_CONTACT : FTS_EVENT_DOWN, hits[best].x, hits[best].y);
+	for (i = 1; i < NVT_MAX_TOUCHES; i++) {
+		if (fingers[i].down) {
 			finger_update(i, FTS_EVENT_UP, fingers[i].x, fingers[i].y);
 		}
 	}
@@ -1522,8 +1614,8 @@ micros_now(void)
 static void
 touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	/* Novatek INT often stays low; sample often enough that a tap is not a 250 ms lottery */
-	uint32_t poll_us = 2000, latency = 0, reads = 0;
+	/* default 8 ms: on cpus=1 a 2 ms SPI hammer made SpringBoard unusable */
+	uint32_t poll_us = 8000, latency = 0, reads = 0;
 	uint64_t reading = 0;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
@@ -1542,7 +1634,7 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	if (poll_us < 250 || poll_us > 100000) {
-		poll_us = 2000;
+		poll_us = 8000;
 	}
 
 	tlmm_west = ml_io_map(TLMM_WEST_PHYS, TLMM_WEST_MAP_SIZE);
@@ -1571,32 +1663,32 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 		unsigned fail_streak = 0;
 
 		/*
-		 * Both chips hold INT low while a report is waiting. Reading clears it (Novatek's
-		 * Linux driver uses EDGE_RISING because the line rises again after the read).
-		 * On this panel INT often stays low forever, so a "peek every 32 ticks" throttle
-		 * made glass touch sample at ~4 Hz. Drain every poll; only back off when SPI
-		 * keeps failing (that path used to wedge the serial engine / watchdog).
+		 * INT often stays low on this panel, so a level-triggered drain would SPI-hammer
+		 * the only boot CPU. Peek on a timer; ignore 0xff fillers in nvt_parse_points;
+		 * sleep longer while idle so SpringBoard can run.
 		 */
 		for (unsigned tick = 1;; tick++) {
-			uint64_t looked = micros_now(), read_at;
+			uint64_t looked = micros_now(), read_at, gap;
 			uint8_t report[NVT_POINT_DATA_LEN + 2];
 			unsigned int_now = gpio_get(PIN_INT);
-			bool do_read = false;
+			bool do_read = false, filler = false, active;
 
 			stats.polls++;
 			if (!int_now) {
-				if (fail_streak < 8 || (tick % 32) == 0) {
+				if (fail_streak < 8 || (tick % 4) == 0) {
 					do_read = true;
 				}
 			} else {
 				fail_streak = 0;
+				do_read = true;         /* rising-edge style: line high means a new frame */
 			}
 			if (do_read) {
 				if (touch_report(report)) {
 					fail_streak = 0;
 					stats.reports++;
 					if (chip == CHIP_NOVATEK) {
-						if (stats.reports <= 8 || (stats.reports % 200) == 0) {
+						filler = nvt_report_all_ff(report);
+						if (!filler && (stats.reports <= 8 || (stats.reports % 100) == 0)) {
 							printf("citrus-touch: Novatek report %u:"
 							    " %02x %02x %02x %02x %02x %02x %02x %02x"
 							    " %02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -1621,13 +1713,24 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 					redwood_tl("tl: seen %llu read %llu\n", looked, read_at);
 				}
 			}
-			if (tick % (60 * (1000000 / poll_us)) == 0) {
-				printf("citrus-touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-				    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us\n",
-				    stats.reports, stats.polls, stats.bad, stats.points, stats.last_x, stats.last_y,
-				    int_now ? "high" : "low", reads ? reading / reads : 0, poll_us);
+			active = any_finger_down() ||
+			    (nvt_last_valid_us != 0 && looked - nvt_last_valid_us < 200000);
+			if (chip == CHIP_NOVATEK) {
+				gap = active ? NVT_ACTIVE_POLL_US : NVT_IDLE_POLL_US;
+				if (poll_us > gap) {
+					gap = poll_us;  /* boot-arg may slow us further */
+				}
+			} else {
+				gap = poll_us;
 			}
-			sleep_us(poll_us);
+			if (tick % (60 * (1000000 / (unsigned)(gap ? gap : poll_us))) == 0) {
+				printf("citrus-touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
+				    "interrupt line %s; a report takes %llu us to read; gap %llu us%s\n",
+				    stats.reports, stats.polls, stats.bad, stats.points, stats.last_x, stats.last_y,
+				    int_now ? "high" : "low", reads ? reading / reads : 0, gap,
+				    active ? " (active)" : "");
+			}
+			sleep_us((uint32_t)gap);
 		}
 	}
 }
