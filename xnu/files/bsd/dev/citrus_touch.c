@@ -46,7 +46,8 @@
  *
  * Boot args: citrus_touch=1, touch_spi_hz=N (default 400000; Novatek bumps to 8 MHz),
  * citrus_touch_simple=1 (one engine command per package instead of the split),
- * touch_flip=1..3, touch_poll_us=N.
+ * touch_flip=1..3 (Novatek defaults to 2: invert Y — Settings General was hitting Apple ID),
+ * touch_poll_us=N.
  *
  * Register layouts: drivers/clk/qcom/gcc-sm6115.c (vote 0x7900c bits 6,7,8,9,12; SE2 CBCR
  * 0x1f3a4; SE2 RCG 0x1f3a8/0x1f3ac), drivers/pinctrl/qcom/pinctrl-sm6115.c (tiles west
@@ -771,6 +772,11 @@ focaltech_probe(bool verbose)
 
 static uint32_t nvt_event_buf = NVT_EVENT_BUF_ADDR;
 static bool nvt_page_set;
+static const uint8_t *nvt_fw_blob;
+static uint32_t nvt_fw_len;
+static const char *nvt_fw_name;
+static uint64_t nvt_ready_us;
+static unsigned nvt_recoveries;
 
 static bool
 nvt_xfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
@@ -1175,9 +1181,17 @@ novatek_probe(bool verbose)
 					printf("citrus-touch: Novatek SPI mode %u for host-download\n",
 					    (unsigned)(rd(SPI_CPHA) | (rd(SPI_CPOL) << 1)));
 					if (nvt_host_download(citrus_nvt_fw_tianma, CITRUS_NVT_FW_TIANMA_LENGTH,
-					    "tianma") ||
-					    nvt_host_download(citrus_nvt_fw_truly, CITRUS_NVT_FW_TRULY_LENGTH,
+					    "tianma")) {
+						nvt_fw_blob = citrus_nvt_fw_tianma;
+						nvt_fw_len = CITRUS_NVT_FW_TIANMA_LENGTH;
+						nvt_fw_name = "tianma";
+						return true;
+					}
+					if (nvt_host_download(citrus_nvt_fw_truly, CITRUS_NVT_FW_TRULY_LENGTH,
 					    "truly")) {
+						nvt_fw_blob = citrus_nvt_fw_truly;
+						nvt_fw_len = CITRUS_NVT_FW_TRULY_LENGTH;
+						nvt_fw_name = "truly";
 						return true;
 					}
 					printf("citrus-touch: Novatek host-download failed\n");
@@ -1206,7 +1220,7 @@ static struct {
 	uint32_t x, y;
 } fingers[FTS_MAX_TOUCHES];
 
-static uint32_t touch_flip;
+static uint32_t touch_flip = 2;  /* Novatek on citrus: panel Y is opposite the display */
 static unsigned shown;
 
 struct report_stats {
@@ -1287,8 +1301,73 @@ static uint64_t nvt_last_valid_us;      /* last non-filler report (for stuck-con
 #define NVT_STALE_UP_US         150000  /* lift if no real report for 150 ms while held */
 #define NVT_IDLE_POLL_US        16000   /* peek while idle: leave the only CPU for SpringBoard */
 #define NVT_ACTIVE_POLL_US      8000    /* while a finger is down / just lifted */
+/*
+ * Host-download often races the panel bias (LAB/IBB). Vendor re-downloads on every resume
+ * after the display is up. If we never see a contact, re-download once the UI is typically
+ * showing, and again with the other panel binary.
+ */
+#define NVT_RECOVER_AFTER_US    40000000ull
+#define NVT_RECOVER_MAX         3
+#define NVT_WDT_FD_STREAK       10      /* vendor nvt_wdt_fw_recovery */
 
 static uint64_t micros_now(void);
+static unsigned nvt_fd_streak;
+
+static bool
+nvt_redownload(const char *why)
+{
+	const uint8_t *fw = nvt_fw_blob;
+	uint32_t len = nvt_fw_len;
+	const char *name = nvt_fw_name ? nvt_fw_name : "?";
+
+	if (fw == NULL) {
+		return false;
+	}
+	/* second recovery: swap tianma/truly — wrong BOM binary can idle-forever */
+	if (nvt_recoveries >= 2) {
+		if (fw == citrus_nvt_fw_tianma) {
+			fw = citrus_nvt_fw_truly;
+			len = CITRUS_NVT_FW_TRULY_LENGTH;
+			name = "truly";
+		} else {
+			fw = citrus_nvt_fw_tianma;
+			len = CITRUS_NVT_FW_TIANMA_LENGTH;
+			name = "tianma";
+		}
+	}
+	printf("citrus-touch: Novatek recovering (%s) with %s firmware\n", why, name);
+	gpio_output(PIN_RESET, false, PULL_NONE, 8);
+	nvt_write_addr(NVT_ENG_RST_ADDR, 0x5A);
+	sleep_ms(1);
+	gpio_set(PIN_RESET, true);
+	sleep_ms(10);
+	geni_spi_hz(8000000);
+	geni_spi_mode(0);
+	if (!nvt_host_download(fw, len, name)) {
+		printf("citrus-touch: Novatek recovery download failed\n");
+		nvt_page_set = false;
+		return false;
+	}
+	nvt_fw_blob = fw;
+	nvt_fw_len = len;
+	nvt_fw_name = name;
+	nvt_page_set = true;
+	nvt_ready_us = micros_now();
+	nvt_fd_streak = 0;
+	return true;
+}
+
+/* vendor: 0xFD/0xFE fill means the FW watchdog reset the MCU — re-download */
+static bool
+nvt_report_wdt_fd(const uint8_t *point_data)
+{
+	for (uint32_t i = 1; i < 7; i++) {
+		if (point_data[i] != 0xfd && point_data[i] != 0xfe) {
+			return false;
+		}
+	}
+	return true;
+}
 
 static bool
 nvt_report_all_ff(const uint8_t *point_data)
@@ -1339,7 +1418,7 @@ static void
 nvt_parse_points(const uint8_t *point_data)
 {
 	struct {
-		uint32_t x, y;
+		uint32_t x, y, w;
 	} hits[NVT_MAX_TOUCHES];
 	uint32_t nhits = 0, i, best, best_d, dx, dy;
 	uint64_t now;
@@ -1385,13 +1464,18 @@ nvt_parse_points(const uint8_t *point_data)
 		}
 		hits[nhits].x = x;
 		hits[nhits].y = y;
+		hits[nhits].w = point_data[position + 4];
+		if (hits[nhits].w == 0) {
+			hits[nhits].w = 1;
+		}
 		nhits++;
 	}
 
 	/*
 	 * This IC reassigns tracking IDs between frames (1↔2↔4 for one thumb). Posting each
 	 * ID as its own finger makes SpringBoard see jumps and ghost multitouch. Collapse to
-	 * one logical finger (slot 0): keep the contact nearest the previous point.
+	 * one logical finger (slot 0): keep the contact nearest the previous point, or the
+	 * fattest contact on a new down (palm/noise often lands in an earlier slot).
 	 */
 	if (nhits == 0) {
 		if (fingers[0].down) {
@@ -1405,12 +1489,11 @@ nvt_parse_points(const uint8_t *point_data)
 		return;
 	}
 	best = 0;
-	best_d = 0xffffffffu;
 	if (fingers[0].down) {
-		/* previous point is already 0..65535; compare in panel pixels */
 		uint32_t px = (uint32_t)(((uint64_t)fingers[0].x * (touch_max_x - 1)) / 65535);
 		uint32_t py = (uint32_t)(((uint64_t)fingers[0].y * (touch_max_y - 1)) / 65535);
 
+		best_d = 0xffffffffu;
 		for (i = 0; i < nhits; i++) {
 			dx = hits[i].x > px ? hits[i].x - px : px - hits[i].x;
 			dy = hits[i].y > py ? hits[i].y - py : py - hits[i].y;
@@ -1419,6 +1502,16 @@ nvt_parse_points(const uint8_t *point_data)
 				best = i;
 			}
 		}
+	} else {
+		for (i = 1; i < nhits; i++) {
+			if (hits[i].w > hits[best].w) {
+				best = i;
+			}
+		}
+	}
+	if (shown < 16) {
+		printf("citrus-touch: pick %u/%u raw %u,%u w%u flip %u\n",
+		    best, nhits, hits[best].x, hits[best].y, hits[best].w, touch_flip);
 	}
 	finger_update(0, fingers[0].down ? FTS_EVENT_CONTACT : FTS_EVENT_DOWN, hits[best].x, hits[best].y);
 	for (i = 1; i < NVT_MAX_TOUCHES; i++) {
@@ -1620,7 +1713,14 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
-	PE_parse_boot_argn("touch_flip", &touch_flip, sizeof(touch_flip));
+	/* touch_flip=0 keeps the Novatek default (2); pass 4 to mean "no flip" if needed */
+	{
+		uint32_t flip = touch_flip;
+
+		if (PE_parse_boot_argn("touch_flip", &flip, sizeof(flip))) {
+			touch_flip = flip == 4 ? 0 : flip;
+		}
+	}
 	PE_parse_boot_argn("citrus_touch_pause_ms", &pause_ms, sizeof(pause_ms));
 	{
 		uint32_t value = 0;
@@ -1659,6 +1759,10 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	printf("citrus-touch: %s ready; the interrupt line is looked at every %u us; panel %u x %u\n",
 	    chip == CHIP_NOVATEK ? "Novatek" : "FT8719", poll_us, touch_max_x, touch_max_y);
+	if (chip == CHIP_NOVATEK) {
+		nvt_ready_us = micros_now();
+		nvt_recoveries = 0;
+	}
 	{
 		unsigned fail_streak = 0;
 
@@ -1674,6 +1778,24 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 			bool do_read = false, filler = false, active;
 
 			stats.polls++;
+			/*
+			 * Panel bias often lands after our first download. If glass never reports a
+			 * finger, re-host-download like vendor resume (swap binary on the 2nd try).
+			 */
+			if (chip == CHIP_NOVATEK && stats.points == 0 && nvt_fw_blob != NULL &&
+			    nvt_recoveries < NVT_RECOVER_MAX &&
+			    looked - nvt_ready_us >= NVT_RECOVER_AFTER_US) {
+				char why[48];
+
+				snprintf(why, sizeof(why), "no fingers after %u reports", stats.reports);
+				nvt_recoveries++;
+				(void)nvt_redownload(why);
+				fail_streak = 0;
+			}
+			/* cheap hedge: page can stick after a failed SPI fragment */
+			if (chip == CHIP_NOVATEK && (tick % 128) == 0) {
+				nvt_page_set = false;
+			}
 			if (!int_now) {
 				if (fail_streak < 8 || (tick % 4) == 0) {
 					do_read = true;
@@ -1688,6 +1810,18 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 					stats.reports++;
 					if (chip == CHIP_NOVATEK) {
 						filler = nvt_report_all_ff(report);
+						if (nvt_report_wdt_fd(report)) {
+							nvt_fd_streak++;
+							if (nvt_fd_streak >= NVT_WDT_FD_STREAK &&
+							    nvt_fw_blob != NULL && nvt_recoveries < NVT_RECOVER_MAX) {
+								nvt_recoveries++;
+								(void)nvt_redownload("FW watchdog 0xFD");
+								fail_streak = 0;
+								continue;
+							}
+						} else {
+							nvt_fd_streak = 0;
+						}
 						if (!filler && (stats.reports <= 8 || (stats.reports % 100) == 0)) {
 							printf("citrus-touch: Novatek report %u:"
 							    " %02x %02x %02x %02x %02x %02x %02x %02x"
