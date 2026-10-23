@@ -331,7 +331,7 @@ geni_spi_init(uint32_t hz)
 	wr(SE_IRQ_EN, rd(SE_IRQ_EN) | 0xf);
 	wr(GENI_M_IRQ_EN, rd(GENI_M_IRQ_EN) | 0x7fc0007f);
 
-	/* mode 1 (CPOL=0, CPHA=1): the vendor's fts_ts_probe sets spi->mode = SPI_MODE_1 */
+	/* default mode 1 for FocalTech; Novatek probe switches to mode 0 */
 	wr(SPI_LOOPBACK, 0);
 	wr(SPI_DEMUX_SEL, 0);
 	wr(SPI_CPHA, 1);
@@ -458,17 +458,46 @@ static bool spi_split = true;
  * 3 = +set the engine up, 4 = +reset the chip, 5 = everything (the default) */
 static uint32_t steps = 5;
 
+/*
+ * Drive CS on gpio80 as a GPIO. The DT muxes it to qup2 (HW CS0), but with that
+ * mux the status package always comes back 0xff — the chip never sees a select.
+ * Holding CS ourselves matches how redwood_goodix talks to its SPI panel.
+ */
+static bool gpio_cs = true;
+
+static void
+cs_low(void)
+{
+	if (gpio_cs) {
+		gpio_set(PIN_CS, false);
+	}
+}
+
+static void
+cs_high(void)
+{
+	if (gpio_cs) {
+		gpio_set(PIN_CS, true);
+		sleep_us(150);          /* vendor CS_HIGH_DELAY */
+	}
+}
+
 static bool
 spi_package(const uint8_t *tx, uint8_t *rx, uint32_t length)
 {
+	bool ok;
+
+	cs_low();
 	if (!spi_split || length < 2) {
-		return geni_transfer(tx, rx, length, false);
+		ok = geni_transfer(tx, rx, length, false);
+	} else if (!geni_transfer(tx, rx, 1, true)) {
+		ok = false;
+	} else {
+		sleep_us(30);
+		ok = geni_transfer(tx + 1, rx ? rx + 1 : NULL, length - 1, false);
 	}
-	if (!geni_transfer(tx, rx, 1, true)) {
-		return false;
-	}
-	sleep_us(30);
-	return geni_transfer(tx + 1, rx ? rx + 1 : NULL, length - 1, false);
+	cs_high();
+	return ok;
 }
 
 /* ---- the FocalTech chip -------------------------------------------------------------------------- */
@@ -498,7 +527,15 @@ spi_package(const uint8_t *tx, uint8_t *rx, uint32_t length)
 enum { REPORT_UNKNOWN, REPORT_COMMAND, REPORT_BARE };
 
 static uint8_t ft_tx[FTS_MAX_READ + 4], ft_rx[FTS_MAX_READ + 4];
-static enum { CHIP_UNKNOWN, CHIP_FOCALTECH, CHIP_ABSENT } chip;
+static enum { CHIP_UNKNOWN, CHIP_FOCALTECH, CHIP_NOVATEK, CHIP_ABSENT } chip;
+
+static void
+geni_spi_mode(unsigned mode)
+{
+	/* SPI mode: bit0 = CPHA, bit1 = CPOL */
+	wr(SPI_CPHA, mode & 1);
+	wr(SPI_CPOL, (mode >> 1) & 1);
+}
 static int report_kind = REPORT_UNKNOWN;
 static bool fts_with_length = true;     /* the command carries the length (a running firmware) */
 
@@ -645,9 +682,9 @@ static void
 touch_reset(void)
 {
 	gpio_output(PIN_RESET, false, PULL_NONE, 8);
-	sleep_ms(2);
+	sleep_ms(20);           /* vendor fts_reset_proc: 20 ms low */
 	gpio_set(PIN_RESET, true);
-	sleep_ms(200);          /* the vendor waits 200 ms after the release */
+	sleep_ms(200);          /* then 200 ms after the release */
 }
 
 /* Is an FT8719 (or FT8720M) there and running its firmware? */
@@ -701,6 +738,152 @@ focaltech_probe(bool verbose)
 		}
 	}
 	return true;
+}
+
+/* ---- Novatek NT36672x (same pins; SPI mode 0; DT novatek@1 but chip_select forced to 0) ---------- */
+
+#define NVT_SWRST_N8_ADDR       0x3F0FE         /* DT novatek,swrst-n8-addr */
+#define NVT_SPI_RD_FAST_ADDR    0x3F310         /* DT novatek,spi-rd-fast-addr */
+#define NVT_ENG_RST_ADDR        0x7FFF80
+#define NVT_CHIP_VER_TRIM       0x3F004
+#define NVT_CHIP_VER_TRIM_OLD   0x1F64E
+#define NVT_EVENT_BUF_ADDR      0x21C00         /* NT36672A_memory_map; trim 0A xx xx 72 66 03 */
+#define NVT_POINT_DATA_LEN      65
+#define NVT_MAX_TOUCHES         10
+
+static uint32_t nvt_event_buf = NVT_EVENT_BUF_ADDR;
+
+static bool
+nvt_xfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
+{
+	bool ok;
+
+	cs_low();
+	ok = geni_transfer(tx, rx, length, false);
+	cs_high();
+	return ok;
+}
+
+static bool
+nvt_write(uint8_t *buf, uint32_t length)
+{
+	if (length == 0) {
+		return false;
+	}
+	buf[0] |= 0x80;                 /* SPI_WRITE_MASK */
+	return nvt_xfer(buf, NULL, length);
+}
+
+static bool
+nvt_read(uint8_t *buf, uint32_t length)
+{
+	uint8_t tx[128], rx[128];
+	uint32_t transfer;
+
+	if (length < 2 || length + 1 > sizeof(tx)) {
+		return false;
+	}
+	transfer = length + 1;          /* one dummy byte on the wire */
+	memset(tx, 0, transfer);
+	memset(rx, 0, transfer);
+	tx[0] = buf[0] & 0x7f;          /* SPI_READ_MASK */
+	if (!nvt_xfer(tx, rx, transfer)) {
+		return false;
+	}
+	/* vendor copies from rbuf+2 into buf+1 */
+	memcpy(buf + 1, rx + 2, length - 1);
+	return true;
+}
+
+static bool
+nvt_set_page(uint32_t addr)
+{
+	uint8_t buf[3] = { 0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7) };
+
+	return nvt_write(buf, 3);
+}
+
+static bool
+nvt_write_addr(uint32_t addr, uint8_t data)
+{
+	uint8_t buf[3];
+
+	if (!nvt_set_page(addr)) {
+		return false;
+	}
+	buf[0] = (uint8_t)(addr & 0x7f);
+	buf[1] = data;
+	return nvt_write(buf, 2);
+}
+
+static void
+nvt_bootloader_reset(void)
+{
+	nvt_write_addr(NVT_SWRST_N8_ADDR, 0x69);
+	sleep_ms(5);
+	nvt_write_addr(NVT_SPI_RD_FAST_ADDR, 0x00);
+}
+
+static bool
+novatek_probe(bool verbose)
+{
+	uint8_t id[7];
+	uint32_t addrs[] = { NVT_CHIP_VER_TRIM, NVT_CHIP_VER_TRIM_OLD };
+	bool any = false;
+
+	printf("citrus-touch: trying Novatek (SPI mode 0, CS0)\n");
+	geni_spi_mode(0);
+	/* eng reset while reset is low, then release — vendor nvt_ts_probe */
+	gpio_output(PIN_RESET, false, PULL_NONE, 8);
+	nvt_write_addr(NVT_ENG_RST_ADDR, 0x5A);
+	sleep_ms(1);
+	gpio_set(PIN_RESET, true);
+	sleep_ms(10);
+
+	for (unsigned a = 0; a < sizeof(addrs) / sizeof(addrs[0]); a++) {
+		for (int retry = 0; retry < 5; retry++) {
+			nvt_bootloader_reset();
+			if (!nvt_set_page(addrs[a])) {
+				continue;
+			}
+			memset(id, 0, sizeof(id));
+			id[0] = (uint8_t)(addrs[a] & 0x7f);
+			if (!nvt_read(id, 7)) {
+				continue;
+			}
+			if (verbose) {
+				printf("citrus-touch: Novatek trim %#x: %02x %02x %02x %02x %02x %02x\n",
+				    addrs[a], id[1], id[2], id[3], id[4], id[5], id[6]);
+			}
+			/* anything not all-ones / all-zeros means the SPI path reached a chip */
+			/* trim table: mask {1,0,0,1,1,1} for 0A/0B… 72 66 03 → NT36672A */
+			if (id[1] == 0x0a || id[1] == 0x0b || id[1] == 0x0c || id[1] == 0x0e) {
+				if (id[4] == 0x72 && (id[5] == 0x66 || id[5] == 0x65) && id[6] == 0x03) {
+					nvt_event_buf = NVT_EVENT_BUF_ADDR;
+					printf("citrus-touch: Novatek NT36672x at %#x (event buf %#x)\n",
+					    addrs[a], nvt_event_buf);
+					/* leave bootloader; run the firmware from flash */
+					gpio_output(PIN_RESET, false, PULL_NONE, 8);
+					sleep_ms(20);
+					gpio_set(PIN_RESET, true);
+					sleep_ms(500);
+					nvt_set_page(nvt_event_buf);
+					return true;
+				}
+			}
+			if (!((id[1] == 0xff && id[2] == 0xff && id[3] == 0xff) ||
+			    (id[1] == 0x00 && id[2] == 0x00 && id[3] == 0x00))) {
+				any = true;
+				printf("citrus-touch: Novatek-like ID at %#x (not in the NT36672 list)\n", addrs[a]);
+			}
+			sleep_ms(10);
+		}
+	}
+	if (verbose && !any) {
+		printf("citrus-touch: no Novatek chip ID either\n");
+	}
+	geni_spi_mode(1);               /* leave the bus as FocalTech found it */
+	return false;
 }
 
 /* ---- touch reports ------------------------------------------------------------------------------- */
@@ -789,8 +972,61 @@ parse_report(const uint8_t *report)
 }
 
 static bool
+nvt_read_points(uint8_t *point_data)
+{
+	uint8_t buf[NVT_POINT_DATA_LEN + 2];
+
+	if (!nvt_set_page(nvt_event_buf)) {
+		return false;
+	}
+	memset(buf, 0, sizeof(buf));
+	buf[0] = 0;
+	if (!nvt_read(buf, NVT_POINT_DATA_LEN + 1)) {
+		return false;
+	}
+	memcpy(point_data, buf, NVT_POINT_DATA_LEN + 1);
+	return true;
+}
+
+static void
+nvt_parse_points(const uint8_t *point_data)
+{
+	bool seen[NVT_MAX_TOUCHES] = { false };
+
+	for (uint32_t i = 0; i < NVT_MAX_TOUCHES; i++) {
+		uint32_t position = 1 + 6 * i;
+		uint32_t input_id = point_data[position] >> 3;
+		uint32_t state = point_data[position] & 0x07;
+		uint32_t x, y;
+
+		if (input_id == 0 || input_id > NVT_MAX_TOUCHES) {
+			continue;
+		}
+		input_id -= 1;
+		if (state != 0x01 && state != 0x02) {
+			continue;
+		}
+		x = ((uint32_t)point_data[position + 1] << 4) | (point_data[position + 3] >> 4);
+		y = ((uint32_t)point_data[position + 2] << 4) | (point_data[position + 3] & 0x0f);
+		if (x >= touch_max_x || y >= touch_max_y) {
+			continue;
+		}
+		seen[input_id] = true;
+		finger_update(input_id, fingers[input_id].down ? FTS_EVENT_CONTACT : FTS_EVENT_DOWN, x, y);
+	}
+	for (uint32_t i = 0; i < NVT_MAX_TOUCHES; i++) {
+		if (!seen[i] && fingers[i].down) {
+			finger_update(i, FTS_EVENT_UP, fingers[i].x, fingers[i].y);
+		}
+	}
+}
+
+static bool
 touch_report(uint8_t *report)
 {
+	if (chip == CHIP_NOVATEK) {
+		return nvt_read_points(report);
+	}
 	if (report_kind != REPORT_BARE) {
 		if (fts_read(FTS_REG_TOUCH, report, FTS_REPORT_LENGTH) && (report[0] & 0xf0) == 0x90) {
 			if (report_kind == REPORT_UNKNOWN) {
@@ -871,11 +1107,15 @@ show_gpio_state(const char *when)
 static void
 use_engine_pins(void)
 {
-	/* DT qupv3_se2_spi_active: gpio6/7/71 pull-down; cs0 gpio80 pull-up */
+	/* DT qupv3_se2_spi_active: gpio6/7/71 pull-down; CS is gpio (see gpio_cs) */
 	gpio_configure(PIN_SPI_0, PIN_FUNCTION_QUP2, PULL_DOWN, 6, false);
 	gpio_configure(PIN_SPI_1, PIN_FUNCTION_QUP2, PULL_DOWN, 6, false);
 	gpio_configure(PIN_SPI_2, PIN_FUNCTION_QUP2, PULL_DOWN, 6, false);
-	gpio_configure(PIN_CS, PIN_FUNCTION_QUP2, PULL_UP, 6, false);
+	if (gpio_cs) {
+		gpio_output(PIN_CS, true, PULL_UP, 6);          /* idle high; we toggle it */
+	} else {
+		gpio_configure(PIN_CS, PIN_FUNCTION_QUP2, PULL_UP, 6, false);
+	}
 	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);         /* an input; the chip pulls it low for a report */
 }
 
@@ -910,10 +1150,17 @@ bring_up(void)
 		if (spi_hz < 100000 || spi_hz > 10000000) {
 			spi_hz = 400000;
 		}
-		printf("citrus-touch: the bus at %u Hz, %s packages\n", spi_hz,
-		    spi_split ? "split" : "single");
-		printf("citrus-touch: step 3: set the engine up\n");
-		problem = geni_spi_init(spi_hz);
+	{
+		uint32_t hw_cs = 0;
+
+		if (PE_parse_boot_argn("citrus_touch_hw_cs", &hw_cs, sizeof(hw_cs)) && hw_cs) {
+			gpio_cs = false;
+		}
+	}
+	printf("citrus-touch: the bus at %u Hz, %s packages, %s chip select\n", spi_hz,
+	    spi_split ? "split" : "single", gpio_cs ? "GPIO" : "QUP");
+	printf("citrus-touch: step 3: set the engine up\n");
+	problem = geni_spi_init(spi_hz);
 	}
 	if (problem != NULL) {
 		printf("citrus-touch: %s\n", problem);
@@ -933,6 +1180,14 @@ bring_up(void)
 	}
 	if (focaltech_probe(true)) {
 		chip = CHIP_FOCALTECH;
+		return true;
+	}
+	/*
+	 * Same SPI2 / CS0 / reset / IRQ serve either FocalTech or Novatek
+	 * (panel BOM). Novatek's driver forces chip_select=0 and SPI_MODE_0.
+	 */
+	if (novatek_probe(true)) {
+		chip = CHIP_NOVATEK;
 		return true;
 	}
 	show_engine_regs("no answer");
@@ -994,17 +1249,21 @@ touch_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	printf("citrus-touch: FT8719 ready; the interrupt line is looked at every %u us; panel %u x %u\n", poll_us,
-	    touch_max_x, touch_max_y);
+	printf("citrus-touch: %s ready; the interrupt line is looked at every %u us; panel %u x %u\n",
+	    chip == CHIP_NOVATEK ? "Novatek" : "FT8719", poll_us, touch_max_x, touch_max_y);
 	for (unsigned tick = 1;; tick++) {
 		uint64_t looked = micros_now(), read_at;
-		uint8_t report[FTS_REPORT_LENGTH];
+		uint8_t report[NVT_POINT_DATA_LEN + 2];
 
 		stats.polls++;
 		if (!gpio_get(PIN_INT)) {
 			if (touch_report(report)) {
 				stats.reports++;
-				parse_report(report);
+				if (chip == CHIP_NOVATEK) {
+					nvt_parse_points(report);
+				} else {
+					parse_report(report);
+				}
 			} else {
 				stats.bad++;
 			}
