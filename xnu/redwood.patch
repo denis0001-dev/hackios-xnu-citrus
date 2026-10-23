@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9cd24b42caca 100644
+index 44274016a4cf..cfbb194c8405 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -73,6 +73,8 @@ index 44274016a4cf..9cd24b42caca 100644
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_buttons.c	standard
++bsd/dev/citrus_touch.c		standard
++bsd/dev/citrus_buttons.c	standard
 +bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_ufs.c	standard
 +bsd/dev/redwood_ufshc.c	standard
@@ -103,7 +105,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -118,7 +120,7 @@ index 44274016a4cf..9cd24b42caca 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -126,7 +128,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1878,10 +1880,10 @@ index 0316792a3f42..bbef0a4b26d4 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..70a885f1e864 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -73,6 +73,9 @@
+@@ -73,9 +73,20 @@
  #include <sys/kdebug.h>
  
  #include <pexpert/pexpert.h>
@@ -1891,7 +1893,18 @@ index e26a1d70f470..f91095c98d26 100644
  
  #include <console/serial_protos.h>
  
-@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
++/*
++ * BCM2837 is built with +pan, but citrus (Kryo 260 / Cortex-A73) does not
++ * implement PAN. MSR PAN is undefined there and kills the boot CPU before
++ * the panic console exists. arm_pan_supported is set from ID_AA64MMFR1_EL1
++ * before any of those writes.
++ */
++int arm_pan_supported;
++
+ #if CONFIG_TELEMETRY
+ #include <kern/telemetry.h>
+ #endif
+@@ -335,7 +346,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -1903,7 +1916,7 @@ index e26a1d70f470..f91095c98d26 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +361,7 @@ arm_init(
+@@ -354,6 +369,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -1911,7 +1924,7 @@ index e26a1d70f470..f91095c98d26 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +370,19 @@ arm_init(
+@@ -362,14 +378,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -1931,7 +1944,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +398,7 @@ arm_init(
+@@ -385,6 +406,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -1939,7 +1952,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
+@@ -422,10 +444,13 @@ arm_init(
  	}
  #endif
  
@@ -1953,7 +1966,7 @@ index e26a1d70f470..f91095c98d26 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
+@@ -439,11 +464,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -1968,7 +1981,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
+@@ -452,12 +480,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -1985,23 +1998,66 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
+@@ -465,8 +497,11 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
 +	loader_checkpoint(16);
++	kprintf("past cpu_init\n");
  
  	processor_bootstrap();
++	kprintf("processor_bootstrap returned\n");
  
-@@ -514,6 +539,7 @@ arm_init(
+ 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
+ 		xmaxmem = (uint64_t) maxmem * (1024 * 1024);
+@@ -475,6 +510,7 @@ arm_init(
+ 	} else {
+ 		xmaxmem = 0;
+ 	}
++	kprintf("memsize done %llx\n", (unsigned long long)xmaxmem);
+ 
+ #if SCHED_HYGIENE_DEBUG
+ 	{
+@@ -500,20 +536,37 @@ arm_init(
+ 	}
+ #endif /* SCHED_HYGIENE_DEBUG */
+ 
++	kprintf("before time conversion\n");
+ 	nanoseconds_to_absolutetime(XCALL_ACK_TIMEOUT_NS, &xcall_ack_timeout_abstime);
++	kprintf("time conversion done\n");
+ 
+ #if HAS_BP_RET
+ 	PE_parse_boot_argn("bpret", &bp_ret, sizeof(bp_ret));
+ 	set_bp_ret(); // Apply branch predictor retention settings to boot CPU
+ #endif
+ 
++	kprintf("before nmi parse\n");
+ 	PE_parse_boot_argn("immediate_NMI", &force_immediate_debug_halt, sizeof(force_immediate_debug_halt));
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	{
++		uint64_t mmfr1;
++
++		__asm__ volatile("mrs %0, ID_AA64MMFR1_EL1" : "=r"(mmfr1));
++		/* ID_AA64MMFR1_EL1.PAN is bits [23:20]. 0 means MSR PAN is undefined. */
++		arm_pan_supported = ((mmfr1 >> 20) & 0xfull) != 0;
++		kprintf("mmfr1 %llx pan %d\n", mmfr1, arm_pan_supported);
++		if (arm_pan_supported) {
++			__builtin_arm_wsr("pan", 1);
++		}
++		kprintf("after pan\n");
++	}
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
++	kprintf("calling arm_vm_init xmaxmem %llx\n", xmaxmem);
  	arm_vm_init(xmaxmem, args);
++	kprintf("arm_vm_init returned\n");
 +	loader_checkpoint(17);
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
+@@ -527,7 +580,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2011,7 +2067,7 @@ index e26a1d70f470..f91095c98d26 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
+@@ -569,6 +624,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2019,7 +2075,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
+@@ -647,6 +703,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2027,7 +2083,18 @@ index e26a1d70f470..f91095c98d26 100644
  	machine_startup(args);
  }
  
-@@ -673,6 +703,9 @@ arm_init_cpu(
+@@ -661,7 +718,9 @@ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	if (arm_pan_supported) {
++		__builtin_arm_wsr("pan", 1);
++	}
+ #endif
+ 
+ #ifdef __arm64__
+@@ -673,6 +732,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2037,6 +2104,17 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+@@ -793,7 +855,9 @@ arm_init_idle_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	if (arm_pan_supported) {
++		__builtin_arm_wsr("pan", 1);
++	}
+ #endif
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2147,6 +2225,78 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d89b0f19cff7..0226bd561857 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1812,9 +1812,14 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
+ #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
+ 
++extern void loader_checkpoint(uint64_t n);
++extern void kprintf(const char *fmt, ...) __printflike(1, 2);
++
+ void
+ arm_vm_init(uint64_t memory_size, boot_args * args)
+ {
++	loader_checkpoint(161);
++	kprintf("arm_vm_init: enter top %llx mem %llx\n", args->topOfKernelData, args->memSize);
+ 	vm_map_address_t va_l1, va_l1_end;
+ 	tt_entry_t       *cpu_l1_tte;
+ 	vm_map_address_t va_l2, va_l2_end;
+@@ -1866,7 +1871,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif
+ 
+ 	// Slide the physical aperture to a random page-aligned location within the slide range
++	loader_checkpoint(162);
++	kprintf("arm_vm_init: before early_random\n");
+ 	uint64_t physmap_slide = early_random() & ARM64_PHYSMAP_SLIDE_MASK & ~((uint64_t)PAGE_MASK);
++	kprintf("arm_vm_init: early_random %llx\n", physmap_slide);
+ 	assert(physmap_slide < ARM64_PHYSMAP_SLIDE_RANGE);
+ 
+ 	physmap_base += physmap_slide;
+@@ -1970,7 +1978,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 *
+ 	 *   the so called physical aperture should be statically mapped
+ 	 */
++	loader_checkpoint(163);
++	kprintf("arm_vm_init: init_ptpages %llx..%llx\n", gVirtBase, dynamic_memory_begin);
+ 	init_ptpages(cpu_tte, gVirtBase, dynamic_memory_begin, TRUE, ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
++	kprintf("arm_vm_init: init_ptpages done\n");
++	loader_checkpoint(164);
+ 
+ #if defined(ARM_LARGE_MEMORY)
+ 	/*
+diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
+index 15b949c659ad..6af4f5bf7874 100644
+--- a/osfmk/arm64/copyio.c
++++ b/osfmk/arm64/copyio.c
+@@ -82,10 +82,15 @@ __options_decl(copyio_flags_t, uint32_t, {
+ 	COPYIO_ATOMIC                   = 0x0010,
+ });
+ 
++extern int arm_pan_supported;
++
+ static inline void
+ user_access_enable(void)
+ {
+ #if __ARM_PAN_AVAILABLE__
++	if (!arm_pan_supported) {
++		return;
++	}
+ 	assert(__builtin_arm_rsr("pan") != 0);
+ 	__builtin_arm_wsr("pan", 0);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+@@ -96,6 +101,9 @@ static inline void
+ user_access_disable(void)
+ {
+ #if __ARM_PAN_AVAILABLE__
++	if (!arm_pan_supported) {
++		return;
++	}
+ 	__builtin_arm_wsr("pan", 1);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2179,7 +2329,7 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..4f540f8caf43 100644
+index e76e7e70ab9c..8bb919f182ae 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
 @@ -734,6 +734,9 @@ ml_get_machine_mem(void)
@@ -2365,7 +2515,53 @@ index e76e7e70ab9c..4f540f8caf43 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -2061,6 +2174,27 @@ ml_get_hwclock()
+ 	return timebase;
+ }
+ 
++/*
++ * Qualcomm's virtual CNTVCT on citrus (and similar) is not a full 64-bit
++ * counter: a snapshot of 0x1ffffffff followed by 0x10000002f is a wrap of
++ * the low 32 bits, which makes recount assert that time went backwards.
++ * cpu_timebase holds the last raw CNTVCT; cpu_base_timebase accumulates the
++ * missing high bits.
++ */
++static uint64_t
++ml_extend_cntvct(uint64_t clock, uint64_t timebase)
++{
++	cpu_data_t *cdp = getCpuDatap();
++	uint64_t last = cdp->cpu_timebase;
++
++	if (__improbable(clock < last && (last - clock) > (1ull << 31))) {
++		cdp->cpu_base_timebase += (1ull << 32);
++		timebase += (1ull << 32);
++	}
++	cdp->cpu_timebase = clock;
++	return clock + timebase;
++}
++
+ uint64_t
+ ml_get_timebase()
+ {
+@@ -2074,7 +2208,7 @@ ml_get_timebase()
+ 		os_compiler_barrier();
+ 	} while (getCpuDatap()->cpu_base_timebase != timebase);
+ 
+-	return clock + timebase;
++	return ml_extend_cntvct(clock, timebase);
+ }
+ 
+ /**
+@@ -2126,7 +2260,7 @@ ml_get_speculative_timebase(void)
+ 		os_compiler_barrier();
+ 	} while (getCpuDatap()->cpu_base_timebase != timebase);
+ 
+-	return clock + timebase;
++	return ml_extend_cntvct(clock, timebase);
+ }
+ 
+ uint64_t
+@@ -2237,8 +2371,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
@@ -2382,6 +2578,37 @@ index e76e7e70ab9c..4f540f8caf43 100644
  }
  
  void
+diff --git a/osfmk/arm64/pcb.c b/osfmk/arm64/pcb.c
+index 7b98a3323d3a..870489e8f9a4 100644
+--- a/osfmk/arm64/pcb.c
++++ b/osfmk/arm64/pcb.c
+@@ -28,6 +28,8 @@
+ 
+ #include <debug.h>
+ 
++extern int arm_pan_supported;
++
+ #include <types.h>
+ 
+ #include <mach/mach_types.h>
+@@ -168,7 +170,7 @@ machine_switch_context(thread_t old,
+ 	thread_t retval;
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
++	if (arm_pan_supported && __improbable(__builtin_arm_rsr("pan") == 0)) {
+ 		panic("context switch with PAN disabled");
+ 	}
+ #endif
+@@ -511,7 +513,7 @@ machine_stack_handoff(thread_t old,
+ 	vm_offset_t  stack;
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
++	if (arm_pan_supported && __improbable(__builtin_arm_rsr("pan") == 0)) {
+ 		panic("stack handoff with PAN disabled");
+ 	}
+ #endif
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5a1cce..a54e35035cde 100644
 --- a/osfmk/arm64/start.s
@@ -2876,6 +3103,76 @@ index 4fb223ee9788..df563bc04910 100644
 +	    __base_ ## it = (typeof(it))((vm_address_t)__base_ ## it + percpu_section_size()))
  
  #pragma mark - implementation details
+ 
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index aad9f3b7bafe..047db9c4de6b 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -189,6 +189,7 @@ int sched_enable_smt = 1;
+ void
+ processor_bootstrap(void)
+ {
++	kprintf("processor_bootstrap: enter\n");
+ 	/* Initialize PSET node and PSET associated with boot cluster */
+ 	pset_node0.psets = &pset0;
+ 	pset_node0.pset_cluster_type = PSET_SMP;
+@@ -201,6 +202,11 @@ processor_bootstrap(void)
+ 	 * same kind of initialization done via ml_processor_register()
+ 	 */
+ 	ml_topology_cluster_t *boot_cluster = topology_info->boot_cluster;
++	kprintf("processor_bootstrap: boot_cluster %p cpus %u\n", boot_cluster, topology_info->num_cpus);
++	if (boot_cluster == NULL) {
++		boot_cluster = &topology_info->clusters[0];
++		kprintf("processor_bootstrap: no boot cluster, using 0\n");
++	}
+ 	pset0.pset_id = boot_cluster->cluster_id;
+ 	pset0.pset_cluster_id = boot_cluster->cluster_id;
+ 	if (boot_cluster->cluster_type == CLUSTER_TYPE_E) {
+@@ -231,6 +237,7 @@ processor_bootstrap(void)
+ 	queue_init(&corpse_tasks);
+ 
+ 	processor_init(master_processor, master_cpu, &pset0);
++	kprintf("processor_bootstrap: leave\n");
+ }
+ 
+ /*
+diff --git a/osfmk/kern/recount.c b/osfmk/kern/recount.c
+index 7c30ee9648fb..55572be7d099 100644
+--- a/osfmk/kern/recount.c
++++ b/osfmk/kern/recount.c
+@@ -411,8 +411,11 @@ static void
+ recount_snap_diff(struct recount_snap *result,
+     const struct recount_snap *lhs, const struct recount_snap *rhs)
+ {
+-	assert3u(lhs->rsn_time_mach, >=, rhs->rsn_time_mach);
+-	result->rsn_time_mach = lhs->rsn_time_mach - rhs->rsn_time_mach;
++	if (lhs->rsn_time_mach < rhs->rsn_time_mach) {
++		result->rsn_time_mach = 0;
++	} else {
++		result->rsn_time_mach = lhs->rsn_time_mach - rhs->rsn_time_mach;
++	}
+ #if CONFIG_PERVASIVE_CPI
+ 	assert3u(lhs->rsn_insns, >=, rhs->rsn_insns);
+ 	assert3u(lhs->rsn_cycles, >=, rhs->rsn_cycles);
+@@ -841,7 +844,8 @@ recount_precise_transition_diff(struct recount_snap *diff,
+ 	// in this configuration.
+ 	if (__improbable(no_precise_pmcs)) {
+ 		cur->rsn_time_mach = recount_timestamp_speculative();
+-		diff->rsn_time_mach = cur->rsn_time_mach - last->rsn_time_mach;
++		diff->rsn_time_mach = (cur->rsn_time_mach < last->rsn_time_mach) ? 0 :
++		    cur->rsn_time_mach - last->rsn_time_mach;
+ 	} else
+ #endif // PRECISE_USER_KERNEL_PMC_TUNABLE
+ 	{
+@@ -850,7 +854,8 @@ recount_precise_transition_diff(struct recount_snap *diff,
+ 	}
+ #else // PRECISE_USER_KERNEL_PMCS
+ 	cur->rsn_time_mach = recount_timestamp_speculative();
+-	diff->rsn_time_mach = cur->rsn_time_mach - last->rsn_time_mach;
++	diff->rsn_time_mach = (cur->rsn_time_mach < last->rsn_time_mach) ? 0 :
++	    cur->rsn_time_mach - last->rsn_time_mach;
+ #endif // !PRECISE_USER_KERNEL_PMCS
+ }
  
 diff --git a/osfmk/kern/sched.h b/osfmk/kern/sched.h
 index a5f68ade084b..9741eb1b3ecd 100644

@@ -218,6 +218,8 @@ redwood_input_init(void)
 	redwood_virtio_input_init();
 	redwood_goodix_init();
 	redwood_buttons_init();
+	citrus_touch_init();            /* citrus_touch=1: FT8719 on SM6115 SPI2 */
+	citrus_buttons_init();          /* citrus_buttons=1, or with citrus_touch=1 */
 	redwood_battery_init();
 	redwood_ufs_init();
 	redwood_net_init();
