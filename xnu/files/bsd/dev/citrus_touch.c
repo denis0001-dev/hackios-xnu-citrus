@@ -124,6 +124,7 @@ sleep_ms(uint32_t ms)
 #define TLMM_SOUTH_MAP_SIZE     0x2000UL        /* cfg + io for gpio 103 */
 
 #define PULL_NONE               0
+#define PULL_DOWN               1
 #define PULL_UP                 3
 #define PIN_FUNCTION_QUP2       1                                /* the device tree's "qup2" */
 
@@ -330,10 +331,10 @@ geni_spi_init(uint32_t hz)
 	wr(SE_IRQ_EN, rd(SE_IRQ_EN) | 0xf);
 	wr(GENI_M_IRQ_EN, rd(GENI_M_IRQ_EN) | 0x7fc0007f);
 
-	/* mode 0, chip select 0, 8 bits, most significant first, four bytes in a FIFO word */
+	/* mode 1 (CPOL=0, CPHA=1): the vendor's fts_ts_probe sets spi->mode = SPI_MODE_1 */
 	wr(SPI_LOOPBACK, 0);
 	wr(SPI_DEMUX_SEL, 0);
-	wr(SPI_CPHA, 0);
+	wr(SPI_CPHA, 1);
 	wr(SPI_CPOL, 0);
 	wr(SPI_DEMUX_OUTPUT_INV, 0);
 	wr(SPI_TRANS_CFG, rd(SPI_TRANS_CFG) & ~2u);
@@ -527,17 +528,21 @@ fts_status(uint8_t *status)
 	return true;
 }
 
-/* Is the chip's SPI interface ready for the next package? (bit 7 is busy) */
+/*
+ * Is the chip's SPI interface ready for the next package?
+ * Vendor focaltech_spi.c: mask 0x81; idle is 0x01 with firmware running, 0x00 in boot ROM.
+ */
 static bool
 fts_wait_idle(void)
 {
 	uint8_t status = 0;
+	uint8_t want = fts_with_length ? 0x01 : 0x00;
 
 	for (int i = 0; i < 100; i++) {
-		if (fts_status(&status) && !(status & 0x80)) {
+		sleep_us(150);
+		if (fts_status(&status) && (status & 0x81) == want) {
 			return true;
 		}
-		sleep_us(150);
 	}
 	return false;
 }
@@ -658,10 +663,15 @@ focaltech_probe(bool verbose)
 	 */
 	for (unsigned attempt = 0; attempt < 4; attempt++) {
 		bool split = (attempt & 1) == 0;
+		uint8_t status = 0;
 
 		spi_split = split;
 		fts_with_length = attempt < 2;
 		high = low = 0;
+		if (verbose && fts_status(&status)) {
+			printf("citrus-touch: status %#x before ID (%s packages, command %s the length)\n",
+			    status, split ? "split" : "single", fts_with_length ? "with" : "without");
+		}
 		if (!fts_read(FTS_REG_CHIP_ID, &high, 1) || !fts_read(FTS_REG_CHIP_ID2, &low, 1)) {
 			if (verbose) {
 				printf("citrus-touch: no answer at the chip's ID registers (%s packages, command %s the length)\n",
@@ -861,9 +871,10 @@ show_gpio_state(const char *when)
 static void
 use_engine_pins(void)
 {
-	gpio_configure(PIN_SPI_0, PIN_FUNCTION_QUP2, PULL_NONE, 6, false);
-	gpio_configure(PIN_SPI_1, PIN_FUNCTION_QUP2, PULL_NONE, 6, false);
-	gpio_configure(PIN_SPI_2, PIN_FUNCTION_QUP2, PULL_NONE, 6, false);
+	/* DT qupv3_se2_spi_active: gpio6/7/71 pull-down; cs0 gpio80 pull-up */
+	gpio_configure(PIN_SPI_0, PIN_FUNCTION_QUP2, PULL_DOWN, 6, false);
+	gpio_configure(PIN_SPI_1, PIN_FUNCTION_QUP2, PULL_DOWN, 6, false);
+	gpio_configure(PIN_SPI_2, PIN_FUNCTION_QUP2, PULL_DOWN, 6, false);
 	gpio_configure(PIN_CS, PIN_FUNCTION_QUP2, PULL_UP, 6, false);
 	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);         /* an input; the chip pulls it low for a report */
 }
