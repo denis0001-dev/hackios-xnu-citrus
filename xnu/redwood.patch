@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..cfbb194c8405 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -83,6 +83,7 @@ index 44274016a4cf..cfbb194c8405 100644
 +bsd/dev/redwood_apple80211.c	standard
 +bsd/dev/redwood_cpufreq.c	standard
 +bsd/dev/redwood_adreno.c	standard
++bsd/dev/citrus_adreno.c		standard
 +bsd/dev/redwood_audio.c		standard
 +bsd/dev/redwood_virtio_sound.c	standard
 +bsd/dev/redwood_speaker.c	standard
@@ -105,7 +106,7 @@ index 44274016a4cf..cfbb194c8405 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
