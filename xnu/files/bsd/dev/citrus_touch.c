@@ -192,7 +192,7 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 /* ---- clocks (GCC at 0x1400000) ------------------------------------------------------------------ */
 
 #define GCC_PHYS                0x01400000UL
-#define GCC_SIZE                0x00020000UL    /* through SE2 RCG at 0x1f3ac */
+#define GCC_SIZE                0x00080000UL    /* vote at 0x7900c, SE2 RCG at 0x1f3ac */
 #define GCC_VOTE                (gcc + 0x7900c)         /* the application processor's votes */
 #define VOTE_M_AHB              (1u << 6)
 #define VOTE_S_AHB              (1u << 7)
