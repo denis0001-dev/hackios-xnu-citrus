@@ -52,16 +52,44 @@ replacements, the return-to-loader path. What is redwood-specific and needs look
   feeding `/dev/redwood-touch` (`bsd/dev/redwood_input.c`);
 - **buttons, CPU frequency, watchdog**: GPIO/PMIC numbers and the EPSS block in `redwood_input.c`,
   `redwood_cpufreq.c`, `osfmk/arm64/loader_return.c`;
-- **GPU / Wi-Fi / sound**: `redwood_adreno.c` (Adreno 642L), `redwood_wifi.c` (WCN6750 + ath11k), `redwood_audio.c`
-  — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused, the addresses and firmware differ.
+- **GPU / Wi-Fi / sound**: `redwood_adreno.c` (Adreno 642L) and `citrus_adreno.c` (Adreno 610), `redwood_wifi.c`
+  (WCN6750 + ath11k), `redwood_audio.c` — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused,
+  the addresses and firmware differ. GPU details below.
 
 Start with no extras: the system boots to the lock screen with only the framebuffer, touch and the CPU.
+
+### GPU (Adreno 642L vs Adreno 610)
+
+Redwood (POCO X5 Pro) has an Adreno 642L with a real GMU. Citrus (POCO M3, SM6115) has an Adreno 610 with a GMU
+wrapper and no GMU firmware. `gpu=1` picks a path from what is in `fw/`: `a660_gmu.bin` → redwood; `a610_zap.mdt`
+without that GMU image → citrus. `adreno_plat=redwood|citrus` overrides that when both trees are present.
+
+| | redwood (Adreno 642L / a660) | citrus (Adreno 610) |
+|---|---|---|
+| driver | `bsd/dev/redwood_adreno.c` | `bsd/dev/citrus_adreno.c` |
+| power | real GMU (`a660_gmu.bin`, HFI) | GMU wrapper at `0x0596a000`; CPU-owned GDSCs/clocks; no GMU firmware |
+| MMIO | `0x03d*` (3D core `0x03d00000`) | `0x059*` (3D core `0x05900000`, SMMU `0x059a0000`) |
+| chip id | `0x06030500` | `0x06000600` |
+| GMEM | 512 KiB | 128 KiB |
+| SQE | `a660_sqe.fw` | `a630_sqe.fw` |
+| zap | `a660_zap.mdt` + `.b00`/`.b01`/`.b02` | `a610_zap.mdt` + `.b00`/`.b01`/`.b02` |
+| recover | `gpu_recover=1` resets GX | leave `gpu_recover=0` (A610 GX reset hang) |
+
+Firmware is the vendor's and never goes into git. Redwood pulls `a660_{gmu.bin,sqe.fw,zap.*}` from the phone's
+`/vendor/firmware`. Citrus pulls `a610_zap.*` from the same place; `a630_sqe.fw` is not on the POCO M3 vendor
+image — take it from [linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) `qcom/a630_sqe.fw` into
+`fw-gpu/`. `userland/build.sh` warns if `a610_zap.mdt` is there without `a630_sqe.fw`, or if neither
+`a660_gmu.bin` nor `a610_zap.mdt` is present.
+
+Citrus still boots with `cpus=3`. Do not default `gpu=1` until bring-up is proven. Validation cmdline:
+`bootcpu=1 cpus=3 citrus_touch=1 gpu=1 gpu_recover=0`, with `GL=1` images.
 
 ## 4. Firmware
 
 Vendor firmware never goes into the repository; it comes from the phone's own Android (`FIRMWARE` in the profile
 lists what to pull, see README "On the phone"). Without `fw-gpu/` the kernel does not start the GPU and says so only
-deep in the log (`adreno: THE GPU IS NOT STARTED`); `userland/build.sh` prints which firmware went into the image.
+deep in the log (`adreno: THE GPU IS NOT STARTED`); `userland/build.sh` prints which firmware went into the image
+and warns if the GPU set is incomplete (a660 GMU on redwood, a610 zap + `a630_sqe.fw` on citrus).
 
 ## 5. Run
 
