@@ -37,7 +37,7 @@ fi
 
 if ! skip loader; then
 	if command -v clang >/dev/null && command -v lld-link >/dev/null; then
-		xnuloader/build.sh && echo "build: loader xnuloader/loader.efi"
+		xnuloader/build.sh "$DEVICE" && echo "build: loader xnuloader/loader.efi"
 	else
 		echo "build: no clang/lld-link: using prebuilt/loader.efi"
 	fi

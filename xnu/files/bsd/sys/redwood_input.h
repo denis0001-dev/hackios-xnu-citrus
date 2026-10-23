@@ -42,6 +42,8 @@ void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+void citrus_touch_init(void);           /* boot-arg citrus_touch=1: the POCO M3's FocalTech FT8719 (SPI2) */
+void citrus_buttons_init(void);         /* boot-arg citrus_buttons=1: the POCO M3's keys (PM6125 PON and GPIO5) */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */

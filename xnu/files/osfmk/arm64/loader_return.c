@@ -133,15 +133,30 @@ loader_log_line(const char *line)
 	__builtin_arm_wsr64("DAIF", daif);
 }
 
+/* Push the length to RAM so the loader on the other core can see the log growing. */
+static void
+loader_log_publish_len(void)
+{
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)&loader_log_len) : "memory");
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)&loader_log_ring_at) : "memory");
+	__asm__ volatile ("dsb sy");
+}
+
 static void
 loader_log_put_locked(char c)
 {
+	uintptr_t line;
+
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
 			loader_log[loader_log_len++] = c;
+			line = ((uintptr_t)&loader_log[loader_log_len - 1]) & ~63UL;
+			__asm__ volatile ("dc cvac, %0" : : "r" (line));
 		}
 	} else {
 		loader_log[LOADER_LOG_HEAD + loader_log_ring_at] = c;
+		line = ((uintptr_t)&loader_log[LOADER_LOG_HEAD + loader_log_ring_at]) & ~63UL;
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
 		if (++loader_log_ring_at == LOADER_LOG_RING) {
 			loader_log_ring_at = 0;
 			loader_log_wrapped = true;
@@ -149,6 +164,10 @@ loader_log_put_locked(char c)
 		if (!loader_log_wrapped) {
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
+	}
+	/* every cache line of log: the watching core otherwise keeps a stale length and declares a hang */
+	if ((loader_log_len & 63u) == 0) {
+		loader_log_publish_len();
 	}
 }
 
@@ -188,7 +207,7 @@ extern uint64_t loader_stub_slot[4];
  */
 struct loader_live {
 	uint64_t magic;                 /* "XNULIVE!" */
-	uint64_t heartbeat;             /* goes up every HV_WDT_PET_SECONDS while the kernel is alive */
+	volatile uint64_t heartbeat;    /* goes up every HV_WDT_PET_SECONDS while the kernel is alive */
 	const char *log;                /* loader_log */
 	const uint32_t *log_len;        /* how much of it is in use */
 	const uint32_t *log_ring_at;    /* where the ring part is being written */
@@ -401,6 +420,13 @@ loader_return(void)
 void
 loader_checkpoint(uint64_t n)
 {
+	/*
+	 * Say how far the kernel got even when the run is not asked to stop anywhere: the loader
+	 * reads this field as the run's heartbeat, and what it reports is then the last checkpoint.
+	 */
+	loader_live.heartbeat = n;
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)&loader_live.heartbeat));
+	__asm__ volatile ("dsb sy");
 	if (loader_stub_slot[2] == n) {
 		loader_jump(2, n);
 	}
@@ -577,6 +603,8 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
 		memory_report();
 	}
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)&loader_live.heartbeat) : "memory");
+	loader_log_publish_len();
 
 	clock_interval_to_deadline(HV_WDT_PET_SECONDS, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(hv_wdt_call, deadline);

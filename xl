@@ -6,6 +6,8 @@
 #   xl ramdisk [FILE]   upload the big system image (default userland/system.apfs) once; it stays in
 #                       the phone's RAM across kernel runs and is the root filesystem (/dev/md0)
 #                       ("xl ramdisk none" forgets it; the image sent with the kernel is then the root)
+#   xl flashrd PART     write the uploaded image to that GPT partition (userdata only, for now),
+#                       through the loader's own UEFI block I/O: no fastboot size limit
 #   xl screenshot [F]   save what is in the phone's framebuffer as a PNG (default logs/screen.png);
 #                       works during a run too (from another terminal)
 #   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
@@ -44,6 +46,23 @@
 # when the last upload was not from this copy. The record starts empty -- an upload by a copy without
 # this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+# The device this copy works with: XL_DEVICE, or the only profile in the tree.
+# Its profile says where the payload goes and how the boot image is laid out, and
+# the image this script builds has to match the phone's bootloader.
+XL_DEVICE=${XL_DEVICE:-}
+if [ -z "$XL_DEVICE" ]; then
+	for c in common/devices/*.conf; do
+		case "${c##*/}" in _*) continue ;; esac
+		if [ -n "$XL_DEVICE" ]; then XL_DEVICE=ambiguous; break; fi
+		XL_DEVICE=${c##*/}; XL_DEVICE=${XL_DEVICE%.conf}
+	done
+fi
+[ -f "common/devices/$XL_DEVICE.conf" ] || { echo "xl: no device profile (XL_DEVICE)"; exit 1; }
+# shellcheck disable=SC1090
+. "common/devices/$XL_DEVICE.conf"
+FD_BASE=${FD_BASE:-0x9FD00000}; FD_SIZE=${FD_SIZE:-0x200000}; PAYLOAD_BASE=${PAYLOAD_BASE:-0xF0000000}
+UEFI_TARGET=${UEFI_TARGET:-redwood}; DTB=${DTB:-}; BOOT_HEADER=${BOOT_HEADER:-1}
+export FD_BASE FD_SIZE PAYLOAD_BASE UEFI_TARGET DTB BOOT_HEADER
 # the kernel and the loader built here, or else the ones that come with the repository
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 [ -f $K ] || K=prebuilt/mach.development.bcm2837
@@ -82,15 +101,32 @@ enter() {
 		[ "$(state)" = absent ] && { echo "xl: phone not reachable"; return 1; }
 		enter; return ;;
 	esac
+	# A fastboot device that is not the stock bootloader is our loader: it must not be
+	# flashed to (it does not take a flash) and it does not need a new image.
+	local who
+	who=$(FB_TIMEOUT=8 fb getvar product 2>/dev/null | head -1)
+	case "$who" in
+	*xnuloader*) echo "xl: the loader is there"; return 0 ;;
+	esac
 	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null &&
 		./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
 	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
+	# Some bootloaders (the Poco M3's, for one) have no "fastboot boot": the image is
+	# flashed to the boot partition instead, and the phone is rebooted into it.
 	local try
 	for try in 1 2; do
-		FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY || { sleep 3; continue; }
-		sleep 6
-		wait_for loader 30 && return 0
-		[ "$(state)" = fastboot ] || break
+		if FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY; then
+			sleep 6
+			wait_for loader 90 && return 0
+			[ "$(state)" = fastboot ] || break
+		elif fb flash boot xnu-usb.img | grep -q OKAY; then
+			fb reboot >/dev/null
+			sleep 6
+			wait_for loader 90 && return 0
+			[ "$(state)" = fastboot ] || break
+		else
+			sleep 3
+		fi
 	done
 	echo "xl: loader did not come up on USB (state: $(state))"; return 1
 }
@@ -232,6 +268,18 @@ ramdisk() { # ramdisk [<file>|none]
 	printf '%s\t%s\t%s\n' "$(pwd)" "$1" "$size" > $PHONE.ramdisk 2>/dev/null
 }
 
+flashrd() { # flashrd <partition>: write the resident image (xl ramdisk) to that partition, through the loader
+	enter || return 1
+	[ -n "$1" ] || { echo "xl: usage: xl flashrd userdata"; return 1; }
+	[ -f $PHONE.ramdisk ] || { echo "xl: no resident image: upload one with xl ramdisk first"; return 1; }
+	local f=$(cut -f2 $PHONE.ramdisk) t0=$(date +%s) size
+	[ -f "$f" ] || { echo "xl: the resident image's file $f is gone"; return 1; }
+	size=$(stat -c %s "$f")
+	echo "xl: writing $(( size / 1048576 )) MB of $f to $1 through the loader (UEFI block I/O)"
+	FB_TIMEOUT=3600 fb oem flashrd "$1" || return 1
+	echo "xl: $1 written in $(( $(date +%s) - t0 )) s"
+}
+
 screenshot() { # screenshot [file.png]
 	enter || return 1
 	local out=${1:-logs/screen.png} geom
@@ -282,6 +330,7 @@ recording) recording "$2" ;;
 camera) camera "$2" ;;
 sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
+flashrd) flashrd "$2" ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;
 log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;

@@ -5,6 +5,11 @@
 !/.gitignore
 !/README.md
 !/LICENSE
+!/.cursor/
+/.cursor/*
+!/.cursor/mcp.json
+!/mcp/
+/mcp/__pycache__/
 !/common/
 !/docs/
 !/xl

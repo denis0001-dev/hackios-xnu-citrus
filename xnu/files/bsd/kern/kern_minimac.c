@@ -262,6 +262,11 @@ minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
  *                         scrolls, and takes a refusal for a programming error ("Failed to create
  *                         work interval"): SpringBoard died of it on the first swipe between
  *                         pages of the home screen.
+ *   PRIV_PROC_CPUMON_OVERRIDE
+ *                         the same: lsd asks to raise the CPU-usage cap and, without the
+ *                         entitlement, is clamped and retries several times a second. Each
+ *                         refusal prints with interrupts off, and on one core that starves
+ *                         SpringBoard until the panel is stuck on the Apple boot logo.
  *
  * Whatever is refused is said once, to learn what there is. Boot-arg privs=0: only
  * PRIV_WORK_INTERVAL, as before.
@@ -322,7 +327,7 @@ minisandbox_priv_grant(kauth_cred_t cred, int priv)
 	static unsigned seen_count;
 	proc_t proc = current_proc();
 
-	if (priv == PRIV_WORK_INTERVAL) {
+	if (priv == PRIV_WORK_INTERVAL || priv == PRIV_PROC_CPUMON_OVERRIDE) {
 		return 0;
 	}
 	/* (the entitlements are the current process's: only for a question about its own credential) */

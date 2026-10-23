@@ -15,7 +15,9 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
+#ifndef PAYLOAD_BASE
 #define PAYLOAD_BASE        0xF0000000ULL
+#endif
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -30,8 +32,8 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
  * offset inside the kernel's memory window, once; it then survives any
  * number of kernel runs (nothing writes to it: the root is read-only).
  */
-#define RESIDENT_RD_OFFSET  0x08000000ULL
-#define RESIDENT_RD_RESERVE 0x30000000ULL         /* RAM that must remain for the kernel itself */
+#define RESIDENT_RD_OFFSET  0x08000000ULL         /* only where a payload header puts one (QEMU) */
+#define RESIDENT_RD_KERNEL_MIN 0x05000000ULL      /* RAM the kernel and the payload's ramdisk need */
 #define PAGE_SIZE_MAX       0x4000ULL
 
 #define LOG_PARTITION       u"logdump"
@@ -144,6 +146,14 @@ memcpy(void *dst, const void *src, size_t n)
 	return dst;
 }
 
+static void
+copy_down(uint64_t dst, uint64_t src, uint64_t n)
+{
+	for (uint64_t i = 0; i < n; i += 8) {
+		*(uint64_t *)(uintptr_t)(dst + i) = *(const uint64_t *)(uintptr_t)(src + i);
+	}
+}
+
 static size_t
 str_len(const char *s)
 {
@@ -236,9 +246,9 @@ flush_dcache(uint64_t start, uint64_t end)
 {
 	uint64_t line = 4ULL << ((READ_SYSREG(CTR_EL0) >> 16) & 0xF);
 	for (uint64_t p = start & ~(line - 1); p < end; p += line) {
-		__asm__ volatile ("dc civac, %0" : : "r" (p));
+		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
 	}
-	__asm__ volatile ("dsb sy");
+	__asm__ volatile ("dsb sy" : : : "memory");
 }
 
 static void
@@ -246,9 +256,9 @@ clean_dcache(uint64_t start, uint64_t end)
 {
 	uint64_t line = 4ULL << ((READ_SYSREG(CTR_EL0) >> 16) & 0xF);
 	for (uint64_t p = start & ~(line - 1); p < end; p += line) {
-		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
 	}
-	__asm__ volatile ("dsb sy");
+	__asm__ volatile ("dsb sy" : : : "memory");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -553,6 +563,21 @@ static const struct platform platform_redwood = {
 	.fb_base = 0xE1000000,
 };
 
+static const struct platform platform_citrus = {
+	.name = "citrus",
+	.io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x0f200000, .gic_redist = 0x0f300000,
+	.uart = 0, .log_other_cpu = 1,
+	/*
+	 * SM6115: four Kryo 260 Silver (MPIDR 0..3) then four Gold (0x100..0x103).
+	 * Numbering is not `core << 8` (that would be 0, 0x100, 0x200, ...). plat_core_mpidr()
+	 * maps 0..7 onto those IDs; core_shift is unused for this device.
+	 */
+	.cores = 8, .core_shift = 0,
+	.small_cores = 0x0f,            /* cpu@0..3 Kryo 260 Silver */
+	.fb_base = 0x5C000000,          /* Display Reserved; citrus.conf FB_BASE */
+};
+
 /*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
@@ -560,7 +585,33 @@ static const struct platform platform_redwood = {
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_citrus,
 };
+
+/* Logical core 0..N-1 to the firmware's MPIDR. citrus is two clusters of four, not `core << shift`. */
+static uint64_t
+plat_core_mpidr(const struct platform *p, int core)
+{
+	if (p == &platform_citrus) {
+		if (core < 4) {
+			return (uint64_t)(unsigned)core;
+		}
+		return 0x100ull + (unsigned)(core - 4);
+	}
+	return (uint64_t)core << p->core_shift;
+}
+
+static int
+plat_core_index(const struct platform *p, uint64_t mpidr)
+{
+	if (p == &platform_citrus) {
+		if (mpidr >= 0x100) {
+			return 4 + (int)(mpidr & 3);
+		}
+		return (int)(mpidr & 3);
+	}
+	return (int)(mpidr >> p->core_shift);
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -866,7 +917,7 @@ static void flush_dcache(uint64_t start, uint64_t end);
 /* What the kernel shows a watching loader (struct loader_live in XNU's loader_return.c). */
 struct kernel_live {
 	uint64_t magic;                 /* "XNULIVE!" */
-	uint64_t heartbeat;             /* goes up every 10 seconds while the kernel is alive */
+	volatile uint64_t heartbeat;    /* goes up every 10 seconds while the kernel is alive */
 	uint64_t log, log_len, log_ring_at, log_wrapped;        /* the kernel's virtual addresses: add the slide */
 	uint64_t log_head, log_ring;    /* the log: this much from the start of the boot, then a ring this big */
 	uint64_t recording;             /* (a virtual address too) { physical address, bytes } of a screen recording */
@@ -944,7 +995,7 @@ static uint64_t sound_len;
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
-#define SILENCE_SECONDS         50
+#define SILENCE_SECONDS         180     /* log_len must move; 50s was a false hang while SpringBoard drew */
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
 
 static void wdt_pet(void);
@@ -2260,6 +2311,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
     uint64_t budget)
 {
 	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+	uint32_t last_log = 0;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
@@ -2345,8 +2397,24 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
-			if (live->heartbeat != last_beat) {
-				last_beat = live->heartbeat;
+			uint64_t beat;
+			uint32_t len;
+
+			/*
+			 * Heartbeat and log length are written by the kernel's core with its
+			 * caches on. After NOTE_SECONDS this loop no longer calls
+			 * note_kernel_progress, so a non-volatile load of heartbeat is
+			 * hoisted and never sees the 10 s pets: SpringBoard stays up and
+			 * this core still declares a hang.
+			 */
+			flush_dcache((uint64_t)(uintptr_t)&live->heartbeat,
+			    (uint64_t)(uintptr_t)&live->heartbeat + 8);
+			beat = live->heartbeat;
+			flush_dcache(live->log_len + slide, live->log_len + slide + 4);
+			len = *(volatile uint32_t *)(live->log_len + slide);
+			if (beat != last_beat || len != last_log) {
+				last_beat = beat;
+				last_log = len;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
 			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
 				log_of_hung_kernel(live, slide);
@@ -2617,7 +2685,8 @@ static struct {
 	uint32_t width, height, stride;
 } SCREEN;
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
-static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
+static uint64_t resident_rd_size;   /* root image kept in the window, 0 if none */
+static uint64_t resident_rd_pa;     /* ... at this physical address (0: the payload header's offset) */
 static char last_result[64] = "idle";
 
 static void
@@ -2796,12 +2865,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		resident_rd_size = pi.resident_rd;
 	}
 	if (resident_rd_size != 0) {
-		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
+		uint64_t res_pa = resident_rd_pa != 0 ? resident_rd_pa : phys_base + RESIDENT_RD_OFFSET;
 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+		uint64_t low = (kern_hi + rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 
 		if (kern_hi + rd_size > res_pa) {
 			print("kernel and ramdisk overlap the resident image\n");
 			return 0;
+		}
+		if (resident_rd_pa != 0 && res_pa > low &&
+		    low + res_size + 0x10000 + PAGE_SIZE_MAX <= win_base + win_size) {
+			print("resident image at %x: down to %x, %x bytes\n", res_pa, low, res_size);
+			copy_down(low, res_pa, res_size);
+			res_pa = low;
+			resident_rd_pa = res_pa;
 		}
 		if (rd_size == 0) {
 			rd_pa = res_pa;
@@ -2861,7 +2938,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+			kernel_mpidr = plat_core_mpidr(PLAT, c[8] - '0');
 		}
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
@@ -3179,13 +3256,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
 	 */
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
-	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+	int cpu_count = 1, boot_core = plat_core_index(plat, kernel_mpidr);
 
 	if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
-				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				uint64_t mpidr = plat_core_mpidr(plat, core);
 				int64_t state;
 
 				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
@@ -3221,7 +3298,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+		if (plat->small_cores & (1u << (plat_core_index(plat, cpu_mpidr[i]) & 31))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -3642,12 +3719,13 @@ fb_command(char *cmd)
 
 			if (starts_with(cmd, "oem ramdisk none")) {
 				resident_rd_size = 0;
+				resident_rd_pa = 0;
 				fb_reply("OKAY", "");
 				return;
 			}
 			parse_payload(&pi, 0);
 			log_len = 0;
-			if (!choose_window(&pi) || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
+			if (!choose_window(&pi) || win_size <= RESIDENT_RD_KERNEL_MIN + 0x1000000) {
 				fb_reply("FAIL", "no memory window");
 				return;
 			}
@@ -3661,9 +3739,17 @@ fb_command(char *cmd)
 
 			download_to_ramdisk = 0;
 			if (to_ramdisk) {
-				limit = win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE;
-				dest = (uint8_t *)(win_base + RESIDENT_RD_OFFSET);
+				uint64_t size = (total + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+				uint64_t tail = 0x4200000;
+
+				if (win_size < RESIDENT_RD_KERNEL_MIN + size + tail) {
+					fb_reply("FAIL", "too big for the window");
+					return;
+				}
+				resident_rd_pa = win_base + ((win_size - size - tail) & ~0x1fffffULL);
 				resident_rd_size = 0;
+				dest = (uint8_t *)(uintptr_t)resident_rd_pa;
+				limit = size;
 			}
 			if (total == 0 || total > limit) {
 				fb_reply("FAIL", "bad size");
@@ -3682,6 +3768,7 @@ fb_command(char *cmd)
 			if (got == total) {
 				if (to_ramdisk) {
 					resident_rd_size = total;
+					print("resident image at pa %x size %x\n", resident_rd_pa, total);
 				}
 				fb_reply("OKAY", "");
 			} else {
@@ -3944,7 +4031,9 @@ efi_main(efi_handle image, efi_system_table *st)
 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
 			if (platforms[i]->fb_base == SCREEN.base)
 				PLAT = platforms[i];
-		if (PLAT == &platform_qemu_virt)
+		/* fw_cfg is QEMU-only (0x09020000). A phone GOP that matches no
+		 * platform used to fall through and take a synchronous exception. */
+		if (PLAT == &platform_qemu_virt && SCREEN.base < 0x40000000)
 			ramfb_phone_screen();
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}

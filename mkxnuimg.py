@@ -68,9 +68,31 @@ if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
 dtb = open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
+# The boot image layout. The Poco M3's stock bootloader (and its siblings) refuses an image
+# with header version 1 and the ramdisk at 0: it only accepts the layout of the older
+# "sheng" reference board (header version 0, kernel at 0x8000, ramdisk at 1 MB, tags at 30 MB).
+# BOOT_HEADER=1 (the default) is the old redwood layout; BOOT_HEADER=0 is the citrus one.
+hdr = env_int('BOOT_HEADER', 1)
+cmd = [sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'], '-o', args.output]
+if hdr == 0:
+    # the layout the older "sheng" reference board uses
+    cmd += ['--header_version', '0', '--base', '0x0', '--kernel_offset', '0x00008000',
+            '--ramdisk_offset', '0x01000000', '--second_offset', '0x00000000',
+            '--tags_offset', '0x01e00000', '--pagesize', '4096']
+elif hdr == 2:
+    # the layout the Poco M3's bootloader took in the image that worked:
+    # header version 2, a 16 MB header area, the kernel at 0x1000000 in the file
+    # and loaded at 0x8000.
+    kernel_file_offset = 0x01000000
+    kernel_len = os.path.getsize(kernel)
+    ramdisk_offset = kernel_file_offset + ((kernel_len + 4095) // 4096) * 4096
+    cmd += ['--header_version', '2', '--base', hex(kernel_file_offset), '--kernel_offset', hex(kernel_file_offset),
+            '--ramdisk_offset', hex(ramdisk_offset), '--second_offset', '0x00000000',
+            '--tags_offset', '0x00000100', '--pagesize', '4096', '--os_version', '0x20000199']
+else:
+    cmd += ['--header_version', '1']
 try:
-    subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '-o', args.output])
+    subprocess.check_call(cmd)
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')
