@@ -354,9 +354,11 @@ RedwoodGPUStart(void)
 {
 	IOService * provider = IOService::getPlatform();
 	RedwoodGPU * gpu;
-	uint32_t cached = 0;
+	uint32_t cached = 1;
 
-	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
+	/* Cached GEM buffers by default; gpu_cached=0 selects write-combined (contiguous lower-bank). */
+	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
+	gGPUCached = cached != 0;
 	gGPULock = IOLockAlloc();
 	gpu = OSTypeAlloc(RedwoodGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {

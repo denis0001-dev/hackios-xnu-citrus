@@ -3202,7 +3202,9 @@ static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25,
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 static uint32_t gpu_recover;            /* boot-arg gpu_recover=1: a core that has stopped answering is reset and given work again */
 static uint32_t gpu_recoveries;         /* ... and how many times that has been done in this run */
+#ifndef HACKIOS_ADRENO_610
 uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
+#endif
 extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 static struct {
 	uint64_t start, size;
@@ -3257,7 +3259,9 @@ static unsigned gpu_free_count;
  * not a licence to place anything. Nothing in Mesa is affected either way: freedreno asks
  * VA_SIZE only at drm version 9 and up (FD_VERSION_VA_SIZE), and tools/mesa/redwood-drm says 1.7.
  */
+#ifndef HACKIOS_ADRENO_610
 uint32_t gpu_va;                        /* boot-arg gpu_va: 0 as before, 1 describe, 2 also guard */
+#endif
 #define GPU_ADDRESS_GRANULE     0x10000ull      /* what one allocation is rounded up to */
 static uint64_t gpu_va_used;            /* addresses handed out and not given back */
 static uint32_t gpu_va_live;            /* ... to how many buffers */
@@ -3282,6 +3286,8 @@ gpu_address_span(uint64_t size)
 extern void RedwoodGPUStart(void);
 extern void RedwoodGPUStop(void);       /* takes the clients' lock, then calls redwood_gpu_stop() */
 static void gpu_block_stop(void);
+
+#ifndef HACKIOS_ADRENO_610
 
 /*
  * A run that ends in order -- its time is up, the host asks for the end, five fingers on the
@@ -3788,6 +3794,8 @@ redwood_gpu_recover(void)
 	return true;
 }
 
+#endif /* !HACKIOS_ADRENO_610 */
+
 /* ---- all of it together ---------------------------------------------------------------------------- */
 
 static bool(*const steps[])(void) = {
@@ -3992,6 +4000,12 @@ start_by_itself(void)
 	const char *missing = NULL;
 	uint64_t size;
 
+#if defined(HACKIOS_ADRENO_610)
+	if (image_file("fw", "a610_zap.mdt", &size) != NULL) {
+		printf("adreno: gpu=1 on Adreno 610 (citrus): TopazAdreno handles bring-up, not the 642L GMU path\n");
+		return false;
+	}
+#endif
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
 		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
 		return false;
@@ -4016,9 +4030,18 @@ start_by_itself(void)
  * as long as the steps and the watch after them last, nothing else writes to the log, so that
  * its end -- all that the loader's notes keep -- is about what is being done here.
  */
+#if defined(HACKIOS_ADRENO_610)
+bool hackios_gpu_is_adreno610(void);
+#endif
+
 void
 redwood_adreno_init(void)
 {
+#if defined(HACKIOS_ADRENO_610)
+	if (hackios_gpu_is_adreno610()) {
+		return;                         /* Adreno 610: TopazAdreno.cpp + topaz_adreno_init() */
+	}
+#endif
 	static const char *const what[] = {
 		"", "the clocks outside", "the fuses", "the clock controller", "the CX half's power", "the clocks", "the first words",
 		"the GMU's RPMh sequencer", "the SMMU", "an SMMU context", "the GMU's memory", "TrustZone", "the zap shader's header",
@@ -4082,13 +4105,18 @@ redwood_adreno_init(void)
 			bzero((void *)core_scratch.memory, 4096);
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
+#ifndef HACKIOS_ADRENO_610
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+#endif
 			PE_parse_boot_argn("gpu_recover", &gpu_recover, sizeof(gpu_recover));
 			/* before any client exists: gpu_address_span() must not change under a live buffer */
+#ifndef HACKIOS_ADRENO_610
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
+#endif
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service RedwoodGPU\n");
+#ifndef HACKIOS_ADRENO_610
 			if (gpu_va != 0) {
 				printf("adreno: the 3D core's addresses: %#llx..%#llx are the kernel's to give, "
 				    "%llu KB a time%s (gpu_va=%u)\n", GPU_ADDRESSES_START,
@@ -4096,6 +4124,7 @@ redwood_adreno_init(void)
 				    gpu_va >= 2 ? ", with that much again left unmapped after every buffer" : "",
 				    gpu_va);
 			}
+#endif
 			RedwoodGPUStart();
 			return;
 		}

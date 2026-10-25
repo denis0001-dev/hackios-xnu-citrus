@@ -17,6 +17,7 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PrintLib.h>
 #include <Library/UefiBootServicesTableLib.h>
+#include <Library/UefiLib.h>
 #include <Library/UefiRuntimeServicesTableLib.h>
 
 #include <Protocol/BlockIo.h>
@@ -256,12 +257,32 @@ StartPayloadLoader ()
     }
 
     if (AsciiStrnCmp (Entry->Name, "loader.efi", sizeof (Entry->Name)) == 0) {
-      EFI_HANDLE Handle;
+      EFI_HANDLE  Handle;
+      EFI_STATUS  Status;
+      VOID       *PeCopy;
 
-      if (!EFI_ERROR (gBS->LoadImage (FALSE, gImageHandle, NULL, Entry + 1, Entry->Size, &Handle))) {
-        gBS->StartImage (Handle, NULL, NULL);
+      // The XNUP blob sits in the "Kernel" reserved region; LoadImage/StartImage can
+      // fail when the PE is read from there — copy into pool memory first.
+      PeCopy = AllocatePool (Entry->Size);
+      if (PeCopy == NULL) {
+        Print (L"XnuLoader: no pool for loader.efi (%u bytes)\n", Entry->Size);
+        return;
       }
 
+      CopyMem (PeCopy, Entry + 1, Entry->Size);
+      Status = gBS->LoadImage (FALSE, gImageHandle, NULL, PeCopy, Entry->Size, &Handle);
+      if (EFI_ERROR (Status)) {
+        Print (L"XnuLoader: LoadImage loader.efi failed: %r\n", Status);
+        FreePool (PeCopy);
+        return;
+      }
+
+      Status = gBS->StartImage (Handle, NULL, NULL);
+      if (EFI_ERROR (Status)) {
+        Print (L"XnuLoader: StartImage loader.efi failed: %r\n", Status);
+      }
+
+      FreePool (PeCopy);
       return;
     }
 

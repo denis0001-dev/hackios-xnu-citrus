@@ -83,7 +83,7 @@ index 44274016a4cf..cfbb194c8405 100644
 +bsd/dev/redwood_apple80211.c	standard
 +bsd/dev/redwood_cpufreq.c	standard
 +bsd/dev/redwood_adreno.c	standard
-+bsd/dev/citrus_adreno.c		standard
++bsd/dev/topaz_fw.c		standard
 +bsd/dev/redwood_audio.c		standard
 +bsd/dev/redwood_virtio_sound.c	standard
 +bsd/dev/redwood_speaker.c	standard
@@ -1732,6 +1732,7 @@ index 5fb0a52062e0..6c430c2b23c7 100644
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 +iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
++iokit/Kernel/TopazAdreno.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
@@ -1852,8 +1853,11 @@ index 5bd6f23dd10c..14e0f17409f5 100644
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
 -MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
 +MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837 -Xclang -target-feature -Xclang +pan
- 
- 
++ifeq ($(HACKIOS_ADRENO_610),1)
++MACHINE_FLAGS_ARM64_BCM2837 += -DHACKIOS_ADRENO_610
++endif
++
++
  #
 @@ -857,7 +857,10 @@ LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/sy
  # Default runtime libraries to be linked with the kernel

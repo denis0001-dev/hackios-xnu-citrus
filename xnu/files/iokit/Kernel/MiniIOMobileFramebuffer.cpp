@@ -40,6 +40,8 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 #include "MiniIOSurface.h"
 
+extern "C" void topaz_adreno_init(void);
+
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
@@ -397,6 +399,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	if (!IOService::start(provider)) {
 		return false;
 	}
+	topaz_adreno_init();
 	if (vinfo.v_baseaddr == 0 || vinfo.v_width == 0 || vinfo.v_height == 0 || vinfo.v_depth != 32) {
 		IOLog("MiniIOMobileFramebuffer: no usable boot framebuffer (%ux%u, depth %u)\n", vinfo.v_width, vinfo.v_height,
 		    vinfo.v_depth);

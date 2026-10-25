@@ -26,7 +26,7 @@ if ! skip kernel; then
 		[ "$WIFI_ATH11K" = 1 ] && [ ! -f xnu-deps/build/ath11k/out/ath11k.o ] && { tools/mk-ath11k.sh && tools/mk-wlfw.sh; }
 		# the export check fails after the kernel is linked, on purpose (xnu/README.md): judge by the file
 		touch out/.kernel-start
-		./xnu-build.sh -j"$(nproc)" -k > out/kernel-build.log 2>&1 || true
+		DEVICE=$DEVICE ./xnu-build.sh -j"$(nproc)" -k > out/kernel-build.log 2>&1 || true
 		K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 		[ -f $K ] && { [ $K -nt out/.kernel-start ] || ! grep -q "error:" out/kernel-build.log; } &&
 			echo "build: kernel $(stat -c %s $K) bytes" || die "kernel build failed, see out/kernel-build.log"
@@ -52,8 +52,16 @@ fi
 if ! skip boot && [ "$KIND" = phone ]; then
 	# the UEFI with the loader inside, the way `xl enter` makes it: the loader then brings up its USB link
 	L=xnuloader/loader.efi; [ -f $L ] || L=prebuilt/loader.efi
+	[ "$DEVICE" = citrus ] && xnuloader/build.sh citrus
 	python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=$L --usb > /dev/null
-	FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE UEFI_FD=$UEFI_FD DTB=$DTB UEFI_TARGET=$UEFI_TARGET \
+	BOOT_HEADER=${BOOT_HEADER:-1} FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE \
+		UEFI_FD=$UEFI_FD DTB=$DTB UEFI_TARGET=$UEFI_TARGET BOOT_HEADER=$BOOT_HEADER BOOT_SHIM_DIR=$BOOT_SHIM_DIR \
 		python3 mkxnuimg.py -p out/usb-payload.bin -o out/$DEVICE-boot.img
-	echo "build: out/$DEVICE-boot.img -- boot it with: fastboot boot out/$DEVICE-boot.img (or common/run.sh $DEVICE)"
+	# Poco M3: only flash boot from ./xl enter or this image — same file as xnu-usb.img
+	if [ "$DEVICE" = citrus ]; then
+		cp -f out/$DEVICE-boot.img xnu-usb.img
+		echo "build: xnu-usb.img (citrus loader boot — fastboot flash boot, not fastboot boot)"
+	else
+		echo "build: out/$DEVICE-boot.img -- boot it with: fastboot boot out/$DEVICE-boot.img (or common/run.sh $DEVICE)"
+	fi
 fi
